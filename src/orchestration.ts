@@ -3,6 +3,7 @@
  */
 
 import {
+  validateArchitectStepResult,
   validateCoderDeliverable,
   validatePreDoneDeliverables,
   validateTesterStepResult,
@@ -14,10 +15,10 @@ import {
   StateMachine,
 } from "./fsmEngine.js";
 import {
-  assessWorkspaceContext,
   createSandboxGitRunner,
   finalizeGitWorkspace,
   initializeGitWorkspace,
+  readBlueprintStep,
   readBlueprintSteps,
   validateArchitectureArtifacts,
 } from "./tools.js";
@@ -29,7 +30,9 @@ import {
   type TaskId,
   type TaskState,
 } from "./types.js";
-import { collectWorkspaceChanges } from "./workspaceGit.js";
+import { collectWorkspaceChanges, releaseWorkspaceDiskLocks } from "./workspaceGit.js";
+import { cleanupDockerContainers, killAllTrackedProcesses } from "./processRegistry.js";
+import type { TaskStatus } from "./types.js";
 
 export interface TaskRuntimeSnapshot {
   readonly taskId: TaskId;
@@ -52,6 +55,60 @@ export interface TaskRuntimeSnapshot {
 }
 
 const runtimeByTask = new Map<TaskId, TaskRuntimeSnapshot>();
+const orchestrationAbortControllers = new Map<TaskId, AbortController>();
+
+function statusAllowsArchitectureDispatch(status: TaskStatus): boolean {
+  return status === "PLANNING" || status === "EXECUTING";
+}
+
+export function abortActiveOrchestration(taskId: TaskId): boolean {
+  const controller = orchestrationAbortControllers.get(taskId);
+  if (!controller) {
+    return false;
+  }
+  controller.abort();
+  return true;
+}
+
+export function isOrchestrationAborted(taskId: TaskId): boolean {
+  return orchestrationAbortControllers.get(taskId)?.signal.aborted ?? false;
+}
+
+export function isOrchestrationRunning(taskId: TaskId): boolean {
+  const controller = orchestrationAbortControllers.get(taskId);
+  return controller !== undefined && !controller.signal.aborted;
+}
+
+const MAX_CODER_DELIVERABLE_ATTEMPTS = 3;
+
+export async function terminateTaskOrchestration(
+  sm: StateMachine,
+  taskId: TaskId,
+  sandboxRoot: string,
+  mode: "cancel" | "abort",
+  by: string,
+  reason?: string
+): Promise<TaskState> {
+  abortActiveOrchestration(taskId);
+  await killAllTrackedProcesses("SIGKILL");
+  await cleanupDockerContainers();
+  try {
+    await releaseWorkspaceDiskLocks(sandboxRoot);
+  } catch {
+    // Best-effort cleanup — do not block terminal transition.
+  }
+
+  const signal =
+    mode === "cancel"
+      ? reason !== undefined
+        ? { kind: "TASK_CANCELLED" as const, by, reason }
+        : { kind: "TASK_CANCELLED" as const, by }
+      : reason !== undefined
+        ? { kind: "TASK_ABORTED" as const, by, reason }
+        : { kind: "TASK_ABORTED" as const, by };
+
+  return sm.dispatch(taskId, signal);
+}
 
 function summarizeTokenUsage(steps: readonly StepResult[]): TaskRuntimeSnapshot["tokenUsage"] {
   return steps.reduce(
@@ -119,20 +176,11 @@ async function prepareArchitectureIfNeeded(
     return state;
   }
 
-  const assessment = await assessWorkspaceContext(sandboxRoot);
-  if (!assessment.requiresArchitectureAlignment) {
-    return state;
-  }
-
-  if (await validateArchitectureArtifacts(sandboxRoot)) {
-    const steps = await readBlueprintSteps(sandboxRoot);
-    if (steps.length > 0 && state.blueprintTotalSteps === 0) {
-      return sm.dispatch(taskId, { kind: "ARCHITECTURE_ARTIFACTS_READY", totalSteps: steps.length });
-    }
-    return state;
-  }
-
-  if (state.status === "EXECUTING") {
+  if (
+    statusAllowsArchitectureDispatch(state.status) &&
+    state.architectureAlignmentStatus !== "approved" &&
+    state.status !== "ARCHITECTING"
+  ) {
     return sm.dispatch(taskId, { kind: "ARCHITECTURE_REQUIRED" });
   }
 
@@ -166,13 +214,6 @@ async function validateRoleDeliverable(
 ): Promise<TaskState | null> {
   const gitRunner = createSandboxGitRunner(sandboxRoot);
 
-  if (role === "CODER") {
-    const validation = await validateCoderDeliverable(stepResult, gitRunner);
-    if (!validation.ok) {
-      return rejectDeliverable(sm, taskId, validation.reason);
-    }
-  }
-
   if (role === "TESTER") {
     const testerToolCheck = validateTesterStepResult(stepResult);
     if (!testerToolCheck.ok) {
@@ -191,16 +232,71 @@ async function validateRoleDeliverable(
   return null;
 }
 
+type CoderDeliverableOutcome =
+  | { readonly kind: "ok" }
+  | { readonly kind: "retry"; readonly failures: number }
+  | { readonly kind: "reject"; readonly state: TaskState };
+
+async function validateCoderDeliverableWithRetry(
+  sm: StateMachine,
+  taskId: TaskId,
+  stepResult: StepResult,
+  sandboxRoot: string,
+  executedBlueprintStepIndex: number,
+  failureStreak: number
+): Promise<CoderDeliverableOutcome> {
+  const blueprintStepText =
+    executedBlueprintStepIndex >= 0
+      ? await readBlueprintStep(sandboxRoot, executedBlueprintStepIndex)
+      : null;
+  const validation = await validateCoderDeliverable(
+    stepResult,
+    createSandboxGitRunner(sandboxRoot),
+    blueprintStepText
+  );
+  if (validation.ok) {
+    return { kind: "ok" };
+  }
+
+  const nextFailures = failureStreak + 1;
+  if (nextFailures < MAX_CODER_DELIVERABLE_ATTEMPTS) {
+    console.warn(
+      `[orchestrator] CODER deliverable incomplete for "${taskId}" (attempt ${nextFailures}/${MAX_CODER_DELIVERABLE_ATTEMPTS} on blueprint step ${executedBlueprintStepIndex + 1}): ${validation.reason}`
+    );
+    await sm.dispatch(taskId, { kind: "BLUEPRINT_STEP_RETRY" });
+    return { kind: "retry", failures: nextFailures };
+  }
+
+  return { kind: "reject", state: await rejectDeliverable(sm, taskId, validation.reason) };
+}
+
 async function afterArchitectTurn(
   sm: StateMachine,
   taskId: TaskId,
-  sandboxRoot: string
-): Promise<TaskState> {
-  if (!(await validateArchitectureArtifacts(sandboxRoot))) {
+  sandboxRoot: string,
+  stepResult: StepResult,
+  priorSteps: readonly StepResult[]
+): Promise<TaskState | "retry"> {
+  const state = await sm.getTaskState(taskId);
+  const toolCheck = validateArchitectStepResult(stepResult);
+  const artifactsOk = await validateArchitectureArtifacts(sandboxRoot, { stepResult });
+
+  if (!artifactsOk || !toolCheck.ok) {
+    const architectAttempts = priorSteps.filter((step) => step.agentId.includes("architect")).length;
+    if (architectAttempts < state.retry.max) {
+      console.warn(
+        `[orchestrator] ARCHITECT incomplete for "${taskId}" (attempt ${architectAttempts}/${state.retry.max}): ${
+          toolCheck.ok ? "artifacts invalid or stale (no active write_file this turn)" : toolCheck.reason
+        }`
+      );
+      return "retry";
+    }
     return rejectDeliverable(
       sm,
       taskId,
-      "ARCHITECT did not produce valid .mams-rules.md and task-blueprint.md artifacts."
+      toolCheck.ok
+        ? "ARCHITECT did not produce valid .mams-rules.md and task-blueprint.md artifacts."
+        : toolCheck.reason
     );
   }
   const steps = await readBlueprintSteps(sandboxRoot);
@@ -215,6 +311,24 @@ export async function runTaskOrchestration(
 ): Promise<void> {
   const priorSteps: StepResult[] = [];
   const maxIterations = 250;
+  const abortController = new AbortController();
+  orchestrationAbortControllers.set(taskId, abortController);
+
+  try {
+    await runTaskOrchestrationInner(sm, taskId, sandboxRoot, priorSteps, maxIterations, abortController.signal);
+  } finally {
+    orchestrationAbortControllers.delete(taskId);
+  }
+}
+
+async function runTaskOrchestrationInner(
+  sm: StateMachine,
+  taskId: TaskId,
+  sandboxRoot: string,
+  priorSteps: StepResult[],
+  maxIterations: number,
+  abortSignal: AbortSignal
+): Promise<void> {
 
   const initialState = await sm.getTaskState(taskId);
   if (tierUsesSandbox(initialState.executionTier)) {
@@ -231,7 +345,21 @@ export async function runTaskOrchestration(
   state = await maybeAutoApproveBlueprint(sm, taskId);
   await refreshRuntimeSnapshot(taskId, state, priorSteps, sandboxRoot);
 
+  let coderDeliverableFailures = 0;
+
   for (let i = 0; i < maxIterations; i += 1) {
+    if (abortSignal.aborted || isOrchestrationAborted(taskId)) {
+      console.log(`[orchestrator] Task "${taskId}" orchestration aborted.`);
+      return;
+    }
+
+    state = await sm.getTaskState(taskId);
+
+    if (statusAllowsArchitectureDispatch(state.status)) {
+      state = await prepareArchitectureIfNeeded(sm, taskId, sandboxRoot);
+      state = await maybeAutoApproveBlueprint(sm, taskId);
+    }
+
     state = await sm.getTaskState(taskId);
 
     if (isTerminalStatus(state.status)) {
@@ -292,19 +420,48 @@ export async function runTaskOrchestration(
 
     try {
       const previousStatus = state.status;
+      const executedBlueprintStepIndex =
+        role === "CODER" && state.blueprintTotalSteps > 0 ? state.blueprintStepIndex : -1;
       const { state: nextState, stepResult } = await sm.executeAgentTurn(taskId, role, sandboxRoot, priorSteps);
       priorSteps.push(stepResult);
 
       if (role === "ARCHITECT" && previousStatus === "ARCHITECTING") {
-        state = await afterArchitectTurn(sm, taskId, sandboxRoot);
+        const architectOutcome = await afterArchitectTurn(sm, taskId, sandboxRoot, stepResult, priorSteps);
+        if (architectOutcome === "retry") {
+          await refreshRuntimeSnapshot(taskId, state, priorSteps, sandboxRoot);
+          continue;
+        }
+        state = architectOutcome;
         await refreshRuntimeSnapshot(taskId, state, priorSteps, sandboxRoot);
         continue;
       }
 
-      const rejection = await validateRoleDeliverable(sm, taskId, role, stepResult, sandboxRoot);
-      if (rejection) {
-        await refreshRuntimeSnapshot(taskId, rejection, priorSteps, sandboxRoot);
-        return;
+      if (role === "CODER") {
+        const coderOutcome = await validateCoderDeliverableWithRetry(
+          sm,
+          taskId,
+          stepResult,
+          sandboxRoot,
+          executedBlueprintStepIndex,
+          coderDeliverableFailures
+        );
+        if (coderOutcome.kind === "retry") {
+          coderDeliverableFailures = coderOutcome.failures;
+          state = await sm.getTaskState(taskId);
+          await refreshRuntimeSnapshot(taskId, state, priorSteps, sandboxRoot);
+          continue;
+        }
+        if (coderOutcome.kind === "reject") {
+          await refreshRuntimeSnapshot(taskId, coderOutcome.state, priorSteps, sandboxRoot);
+          return;
+        }
+        coderDeliverableFailures = 0;
+      } else {
+        const rejection = await validateRoleDeliverable(sm, taskId, role, stepResult, sandboxRoot);
+        if (rejection) {
+          await refreshRuntimeSnapshot(taskId, rejection, priorSteps, sandboxRoot);
+          return;
+        }
       }
 
       state = nextState;

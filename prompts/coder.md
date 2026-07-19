@@ -42,12 +42,25 @@ Do not run git commands yourself. When the task reaches `DONE`, the orchestrator
 your **meaningful** file changes (excluding lockfiles) and the Task Contract to create a
 descriptive branch and conventional commit.
 
-## Required before ending your turn
+## Blueprint steps (when `task-blueprint.md` is active)
 
+Each turn executes **one top-level numbered blueprint step** injected into your prompt.
+
+- **Implementation steps** (add/update/create code): you MUST call `write_file` on product paths.
+- **Verification steps** (run tests, prisma format/generate, lint): you may skip `write_file` — use
+  `run_local_tests` with the exact command from the step and report stdout/stderr.
+
+If a step says "Run `npx prisma …`" or "Final Verification", treat it as verification-only.
+
+## Required before ending your turn (implementation steps)
+
+When the current blueprint step requires code changes:
 1. Make at least one successful `write_file` change under `server/` and/or `mobile_app/`
    (cross-stack tasks usually need both).
 2. Run `list_changed_files` to confirm your edits are tracked — not just lockfiles.
 3. Run `run_local_tests` for affected packages and report the actual command output.
 4. In your summary, list every file path and symbol/key you changed.
+
+For **verification-only** blueprint steps, items 1 and 4 may be N/A — but `run_local_tests` is mandatory.
 
 Vague summaries produce vague commits. Lockfile-only changes are rejected.

@@ -29,7 +29,7 @@ import {
   type ToolCallRequest,
   type ToolCallResult,
 } from "./types.js";
-import { createToolSet, PROJECT_RULES_FILENAME, PROJECT_RULES_SECTION_HEADER, readBlueprintStep, resolveSandboxPath } from "./tools.js";
+import { createListRepoStructureTool, createReadFileTool, createToolSet, PROJECT_RULES_FILENAME, PROJECT_RULES_SECTION_HEADER, readBlueprintStep, resolveSandboxPath } from "./tools.js";
 
 export { PROJECT_RULES_FILENAME, PROJECT_RULES_SECTION_HEADER };
 
@@ -171,7 +171,12 @@ export function buildToolsForRole(role: AgentRole, sandboxRoot: string) {
         run_local_tests: full.run_local_tests,
       };
     case "ARCHITECT":
-      return { write_file: full.write_file, read_file: full.read_file, list_changed_files: full.list_changed_files };
+      return {
+        write_file: full.write_file,
+        read_file: createReadFileTool(sandboxRoot, { architectMode: true }),
+        list_repo_structure: createListRepoStructureTool(sandboxRoot),
+        list_changed_files: full.list_changed_files,
+      };
     case "SUPERVISOR":
       return {
         read_file: full.read_file,
@@ -236,8 +241,9 @@ async function buildUserPrompt(role: AgentRole, context: AgentTaskContext): Prom
       [
         "## Context Assessment Deliverables",
         `1. Write or enrich \`${PROJECT_RULES_FILENAME}\` with concrete project rules (no placeholders).`,
-        "2. Write `task-blueprint.md` with a numbered, sequential checklist decomposing the objective.",
-        "Use read_file to inspect the repo, then write_file for both artifacts.",
+        "2. Write `task-blueprint.md` with 8–12 **top-level numbered steps** decomposing the objective.",
+        "Use `list_repo_structure` first, then `read_file` only on allowlisted paths (package.json, schema.prisma).",
+        "You MUST call `write_file` for `task-blueprint.md` before ending your turn.",
       ].join("\n")
     );
   }
@@ -433,7 +439,7 @@ export function resolveMaxToolRoundtripsForRole(role: AgentRole, executionTier?:
       return 5;
     case "ARCHITECT":
     case "SUPERVISOR":
-      return 6;
+      return 4;
     case "CODER":
       if (executionTier === "TIER3_CRITICAL" || executionTier === "TIER4_ENTERPRISE_E2E") {
         return 12;

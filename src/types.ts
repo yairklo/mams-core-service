@@ -168,6 +168,7 @@ export const TASK_STATUSES = [
   "AWAITING_CLOUD_VERIFICATION",
   "ESCALATED",
   "DONE",
+  "CANCELLED",
   "FAILED",
   "ABORTED_FUSE",
 ] as const;
@@ -180,6 +181,7 @@ export function isTaskStatus(value: string): value is TaskStatus {
 
 export const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
   "DONE",
+  "CANCELLED",
   "FAILED",
   "ABORTED_FUSE",
 ]);
@@ -314,6 +316,9 @@ export type TaskSignal =
   | { readonly kind: "ARCHITECTURE_REQUIRED" }
   | { readonly kind: "ARCHITECTURE_ARTIFACTS_READY"; readonly totalSteps: number }
   | { readonly kind: "BLUEPRINT_STEP_ADVANCED"; readonly stepIndex: number; readonly totalSteps: number }
+  | { readonly kind: "BLUEPRINT_STEP_RETRY" }
+  | { readonly kind: "TASK_CANCELLED"; readonly by: string; readonly reason?: string }
+  | { readonly kind: "TASK_ABORTED"; readonly by: string; readonly reason?: string }
   | { readonly kind: "TOOL_CIRCUIT_OPEN"; readonly toolName: string; readonly argsHash: string }
   | {
       readonly kind: "CLOUD_VERIFICATION_RESULT";

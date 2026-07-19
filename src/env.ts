@@ -21,6 +21,8 @@ export const MamsEnvSchema = z
       .enum(["true", "false"])
       .default("true")
       .transform((value) => value === "true"),
+    /** Optional override for Claude Code CLI binary (default: `claude` on PATH). */
+    CLAUDE_CODE_BINARY: z.string().min(1).optional(),
   })
   .refine(
     (env) =>

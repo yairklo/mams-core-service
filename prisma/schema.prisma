@@ -1,10 +1,12 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["multiSchema"]
 }
 
 datasource db {
   provider = "postgresql"
   url      = env("MAMS_DATABASE_URL")
+  schemas  = ["mams"]
 }
 
 model AgentTaskState {
@@ -20,12 +22,15 @@ model AgentTaskState {
   @@index([sessionId])
   @@index([status])
   @@index([parentTaskId])
+  @@schema("mams")
 }
 
 model AgentCostLedger {
   costScopeId String   @id
   spentUsd    Float    @default(0)
   updatedAt   DateTime @updatedAt
+
+  @@schema("mams")
 }
 
 model AgentExecutionLog {
@@ -42,4 +47,5 @@ model AgentExecutionLog {
 
   @@index([taskId])
   @@index([createdAt])
+  @@schema("mams")
 }

@@ -238,6 +238,12 @@ const TRANSITION_TABLE: readonly Transition[] = [
 
   // --- ARCHITECTURE ALIGNMENT ---
   {
+    from: "PLANNING",
+    to: "ARCHITECTING",
+    guard: (_state, signal) => signal.kind === "ARCHITECTURE_REQUIRED",
+    apply: () => ({ architectureAlignmentStatus: "required" as const }),
+  },
+  {
     from: "EXECUTING",
     to: "ARCHITECTING",
     guard: (_state, signal) => signal.kind === "ARCHITECTURE_REQUIRED",
@@ -246,7 +252,26 @@ const TRANSITION_TABLE: readonly Transition[] = [
   {
     from: "ARCHITECTING",
     to: "ARCHITECTING",
-    guard: (_state, signal) => signal.kind === "STEP_RESULT" && isStepResultSuccessful(signal.result),
+    guard: (state, signal) =>
+      signal.kind === "STEP_RESULT" &&
+      !isStepResultSuccessful(signal.result) &&
+      state.retry.attempt < state.retry.max,
+    apply: (state) => ({ retry: { ...state.retry, attempt: state.retry.attempt + 1 } }),
+  },
+  {
+    from: "ARCHITECTING",
+    to: "ESCALATED",
+    guard: (state, signal) =>
+      signal.kind === "STEP_RESULT" &&
+      !isStepResultSuccessful(signal.result) &&
+      state.retry.attempt >= state.retry.max,
+  },
+  {
+    from: "ARCHITECTING",
+    to: "ARCHITECTING",
+    guard: (state, signal) =>
+      signal.kind === "STEP_RESULT" && isStepResultSuccessful(signal.result),
+    apply: (state) => ({ retry: { ...state.retry, attempt: 0 } }),
   },
   {
     from: "ARCHITECTING",
@@ -261,11 +286,6 @@ const TRANSITION_TABLE: readonly Transition[] = [
             blueprintStepIndex: 0,
           }
         : {},
-  },
-  {
-    from: "ARCHITECTING",
-    to: "ESCALATED",
-    guard: (_state, signal) => signal.kind === "STEP_RESULT" && !isStepResultSuccessful(signal.result),
   },
   {
     from: "AWAITING_APPROVAL",

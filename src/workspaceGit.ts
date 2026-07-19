@@ -3,6 +3,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { TaskId } from "./types.js";
 
@@ -36,7 +37,12 @@ export interface WorkspaceChanges {
 }
 
 export function normalizeRepoPath(path: string): string {
-  return path.replace(/\\/g, "/").replace(/^\.\/+/, "");
+  let normalized = path.replace(/\\/g, "/").replace(/^\.\/+/, "").trim();
+  // Git on Windows wraps paths containing spaces/non-ASCII in double quotes.
+  if (normalized.length >= 2 && normalized.startsWith('"') && normalized.endsWith('"')) {
+    normalized = normalized.slice(1, -1);
+  }
+  return normalized;
 }
 
 export function isNoiseGitPath(path: string): boolean {
@@ -49,9 +55,7 @@ export function isMeaningfulSourcePath(path: string): boolean {
   if (isNoiseGitPath(normalized)) {
     return false;
   }
-  if (normalized === ".mams-rules.md" || normalized === "task-blueprint.md") {
-    return true;
-  }
+  // Only product code under known package roots — not root-level docs/artifacts.
   return MEANINGFUL_SOURCE_PREFIXES.some(
     (prefix) => normalized.startsWith(prefix) || normalized.includes(`/${prefix}`)
   );
@@ -68,12 +72,12 @@ export function parseChangedPathsFromPorcelain(porcelain: string): string[] {
     if (!match?.[1]) {
       continue;
     }
-    let pathPart = match[1].trim();
+    let pathPart = normalizeRepoPath(match[1]);
     if (pathPart.includes(" -> ")) {
-      pathPart = pathPart.split(" -> ").pop()?.trim() ?? pathPart;
+      pathPart = normalizeRepoPath(pathPart.split(" -> ").pop()?.trim() ?? pathPart);
     }
     if (pathPart.length > 0) {
-      paths.push(normalizeRepoPath(pathPart));
+      paths.push(pathPart);
     }
   }
   return [...new Set(paths)];
@@ -141,4 +145,23 @@ export function slugifyBranchSegment(input: string): string {
 
 export function buildFallbackBranchName(taskId: TaskId): string {
   return `mams/change-${taskId.replace(/-/g, "").slice(0, 8)}`;
+}
+
+const GIT_LOCK_FILENAMES: readonly string[] = ["index.lock", "HEAD.lock", "shallow.lock", "packed-refs.lock"];
+
+/** Removes stale git lock files left by interrupted workspace operations. */
+export async function releaseWorkspaceDiskLocks(sandboxRoot: string): Promise<void> {
+  const gitDir = join(sandboxRoot, ".git");
+  if (!existsSync(gitDir)) {
+    return;
+  }
+  await Promise.all(
+    GIT_LOCK_FILENAMES.map(async (filename) => {
+      try {
+        await unlink(join(gitDir, filename));
+      } catch {
+        // Ignore missing or in-use locks.
+      }
+    })
+  );
 }

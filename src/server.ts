@@ -4,6 +4,7 @@
 
 import express from "express";
 import { disconnectDatabase } from "./database.js";
+import { checkClaudeCodeAvailability } from "./claudeCode.js";
 import { loadMamsEnv } from "./env.js";
 import { warmGoogleModelResolverCache } from "./googleModelResolver.js";
 import { PrismaFiscalBudgetLedger, StateMachine } from "./fsmEngine.js";
@@ -53,6 +54,15 @@ async function main(): Promise<void> {
 
   const server = app.listen(env.PORT, () => {
     console.log(`[server] MAMS core service listening on port ${env.PORT}`);
+    void checkClaudeCodeAvailability(env).then((availability) => {
+      if (availability.available) {
+        console.log(`[server] Claude Code CLI available (${availability.binary}).`);
+      } else {
+        console.warn(
+          `[server] Claude Code CLI not available — SUPERVISOR escalation tool disabled until installed: ${availability.reason}`
+        );
+      }
+    });
   });
 
   process.on("SIGTERM", () => {

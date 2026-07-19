@@ -20,7 +20,16 @@ import {
 import { tool } from "ai";
 import { z } from "zod";
 import { loadMamsEnv, MamsEnvSchema, type MamsEnv } from "./env.js";
+import {
+  buildClaudeCodeCliArgs,
+  buildClaudeCodeContainerEnv,
+  buildClaudeCodeSpawnEnv,
+  checkClaudeCodeAvailability,
+} from "./claudeCode.js";
+import { validateArchitectStepResult } from "./deliverableValidation.js";
 import { registerChildProcess, registerDockerContainerId } from "./processRegistry.js";
+import { releaseDevServerPorts } from "./portCleanup.js";
+import type { StepResult } from "./types.js";
 
 export { MamsEnvSchema, loadMamsEnv, type MamsEnv };
 
@@ -88,14 +97,14 @@ export async function assessWorkspaceContext(sandboxRoot: string): Promise<Works
   }
 }
 
-/** Parses numbered/checklist steps from `task-blueprint.md`. */
+/** Parses top-level numbered steps only (1. / 2.) — sub-bullets are not separate steps. */
 export async function readBlueprintSteps(sandboxRoot: string): Promise<readonly string[]> {
   try {
     const blueprintPath = resolveSandboxPath(sandboxRoot, TASK_BLUEPRINT_FILENAME);
     const content = await readFile(blueprintPath, "utf8");
     const steps: string[] = [];
     for (const line of content.split("\n")) {
-      const match = line.match(/^\s*(?:\d+[\.)]|[-*])\s+(.+)$/);
+      const match = line.match(/^\s*\d+[\.)]\s+(.+)$/);
       if (match?.[1]) {
         steps.push(match[1].trim());
       }
@@ -111,7 +120,22 @@ export async function readBlueprintStep(sandboxRoot: string, stepIndex: number):
   return steps[stepIndex] ?? null;
 }
 
-export async function validateArchitectureArtifacts(sandboxRoot: string): Promise<boolean> {
+export interface ValidateArchitectureArtifactsOptions {
+  /** Requires ARCHITECT to have successfully written task-blueprint.md in this turn (ignores stale disk files). */
+  readonly stepResult?: StepResult;
+}
+
+export async function validateArchitectureArtifacts(
+  sandboxRoot: string,
+  options: ValidateArchitectureArtifactsOptions = {}
+): Promise<boolean> {
+  if (options.stepResult) {
+    const activeWrite = validateArchitectStepResult(options.stepResult);
+    if (!activeWrite.ok) {
+      return false;
+    }
+  }
+
   try {
     const rulesPath = resolveSandboxPath(sandboxRoot, PROJECT_RULES_FILENAME);
     const blueprintPath = resolveSandboxPath(sandboxRoot, TASK_BLUEPRINT_FILENAME);
@@ -277,6 +301,31 @@ const ReadFileInputSchema = z.object({
 
 /** Keep tool payloads small — each read is re-sent on every subsequent LLM step. */
 export const MAX_READ_FILE_CHARS = 48_000;
+export const MAX_ARCHITECT_READ_FILE_CHARS = 12_000;
+
+/** Raw implementation sources are never readable by ARCHITECT (context bloat). */
+const ARCHITECT_BLOCKED_READ_EXTENSIONS = /\.(ts|tsx|js|jsx|mjs|cjs|py)$/i;
+
+/** ARCHITECT may only read these paths (exploration budget — prevents token blow-ups). */
+export const ARCHITECT_READ_ALLOWLIST: readonly RegExp[] = [
+  /(^|\/)package\.json$/i,
+  /(^|\/)server\/package\.json$/i,
+  /(^|\/)mobile_app\/package\.json$/i,
+  /(^|\/)next_app\/package\.json$/i,
+  /(^|\/)server\/prisma\/schema\.prisma$/i,
+  /(^|\/)app\.json$/i,
+  /(^|\/)tsconfig\.json$/i,
+  /^\.mams-rules\.md$/i,
+  /^task-blueprint\.md$/i,
+];
+
+export function isArchitectReadPathAllowed(relativePath: string): boolean {
+  const normalized = relativePath.replace(/\\/g, "/").replace(/^\.\/+/, "").trim();
+  if (ARCHITECT_BLOCKED_READ_EXTENSIONS.test(normalized)) {
+    return false;
+  }
+  return ARCHITECT_READ_ALLOWLIST.some((pattern) => pattern.test(normalized));
+}
 
 export interface ReadFileOutput {
   readonly path: string;
@@ -312,20 +361,79 @@ function truncateReadFileContent(content: string): Pick<ReadFileOutput, "content
   };
 }
 
-export function createReadFileTool(sandboxRoot: string) {
+export function createReadFileTool(sandboxRoot: string, options: { readonly architectMode?: boolean } = {}) {
   assertSandboxRootIsContained(sandboxRoot);
+  const maxChars = options.architectMode ? MAX_ARCHITECT_READ_FILE_CHARS : MAX_READ_FILE_CHARS;
   return tool({
-    description: `Reads a UTF-8 text file within the task sandbox (max ${MAX_READ_FILE_CHARS} chars; node_modules/ and .git/ blocked).`,
+    description: options.architectMode
+      ? `Reads allowlisted UTF-8 files only (max ${MAX_ARCHITECT_READ_FILE_CHARS} chars): package.json, schema.prisma, app.json, tsconfig, .mams-rules.md.`
+      : `Reads a UTF-8 text file within the task sandbox (max ${MAX_READ_FILE_CHARS} chars; node_modules/ and .git/ blocked).`,
     inputSchema: ReadFileInputSchema,
     execute: async ({ path }): Promise<ReadFileOutput> => {
+      if (options.architectMode && !isArchitectReadPathAllowed(path)) {
+        const allowed = ARCHITECT_READ_ALLOWLIST.map((p) => p.source).join(", ");
+        throw new Error(
+          `Refusing ARCHITECT read of "${path}". Allowed: config files only (${allowed}). ` +
+            `Source files (.ts/.tsx/.js/.py) are blocked — use list_repo_structure for layout.`
+        );
+      }
       const blockedReason = isBlockedReadPath(path);
       if (blockedReason) {
         return { path, content: blockedReason, truncated: false, totalChars: blockedReason.length };
       }
       const absolutePath = resolveSandboxPath(sandboxRoot, path);
       const raw = await readFile(absolutePath, "utf8");
-      const { content, truncated, totalChars } = truncateReadFileContent(raw);
-      return { path, content, ...(truncated !== undefined ? { truncated } : {}), ...(totalChars !== undefined ? { totalChars } : {}) };
+      const totalChars = raw.length;
+      const content =
+        totalChars <= maxChars
+          ? raw
+          : raw.slice(0, maxChars) +
+            `\n\n[TRUNCATED: showing first ${maxChars} of ${totalChars} characters.]`;
+      return {
+        path,
+        content,
+        ...(totalChars > maxChars ? { truncated: true, totalChars } : { totalChars }),
+      };
+    },
+  });
+}
+
+export function createListRepoStructureTool(sandboxRoot: string) {
+  assertSandboxRootIsContained(sandboxRoot);
+  return tool({
+    description:
+      "Lists repository layout (top-level dirs + second level) via git ls-files — use before targeted read_file.",
+    inputSchema: z.object({}).default({}),
+    execute: async (): Promise<{ readonly tree: string; readonly fileCount: number }> => {
+      const realRoot = assertSandboxRootIsContained(sandboxRoot);
+      const runner = createSandboxGitRunner(realRoot);
+      const result = await runner.run(
+        ["ls-files", "--cached", "--others", "--exclude-standard"],
+        "git_ls_files_structure"
+      );
+      const lines = result.stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && !line.includes("node_modules/"));
+      const topLevel = new Set<string>();
+      const secondLevel = new Set<string>();
+      for (const line of lines.slice(0, 800)) {
+        const parts = line.split("/");
+        if (parts[0]) {
+          topLevel.add(parts[0]);
+        }
+        if (parts.length >= 2) {
+          secondLevel.add(`${parts[0]}/${parts[1]}`);
+        }
+      }
+      const tree = [
+        "## Top-level",
+        ...[...topLevel].sort(),
+        "",
+        "## Second level (sample)",
+        ...[...secondLevel].sort().slice(0, 60),
+      ].join("\n");
+      return { tree, fileCount: lines.length };
     },
   });
 }
@@ -370,10 +478,12 @@ function buildDockerInvocation(
   docker: DockerSandboxOptions,
   command: string,
   args: readonly string[],
-  containerName: string
+  containerName: string,
+  containerEnv: Record<string, string> = {}
 ): { readonly command: string; readonly args: readonly string[] } {
   const containerWorkdir = (cwd === "." ? "/workspace" : `/workspace/${cwd}`).replace(/\/+$/, "") || "/workspace";
   registerDockerContainerId(containerName);
+  const envArgs = Object.entries(containerEnv).flatMap(([key, value]) => ["-e", `${key}=${value}`]);
   return {
     command: "docker",
     args: [
@@ -391,6 +501,7 @@ function buildDockerInvocation(
       String(docker.pidsLimit),
       "--user",
       docker.user,
+      ...envArgs,
       "-v",
       `${absoluteSandboxRoot}:/workspace:rw`,
       "-w",
@@ -431,66 +542,73 @@ function runProcess(
   cwd: string,
   timeoutMs: number,
   label: string,
-  isDocker = false
+  isDocker = false,
+  spawnEnv: NodeJS.ProcessEnv = buildSpawnEnv()
 ): Promise<RunLocalTestsOutput> {
   return new Promise((resolvePromise) => {
-    const startedAt = Date.now();
-    const spawnTarget = resolveSpawnTarget(command);
-    const child = spawn(spawnTarget.command, args, {
-      cwd,
-      shell: spawnTarget.shell,
-      env: buildSpawnEnv(),
-    });
-    registerChildProcess(child, label, isDocker);
+    void (async () => {
+      if (label === "run_local_tests" && !isDocker) {
+        await releaseDevServerPorts(command, args);
+      }
 
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let settled = false;
-
-    const appendBounded = (buf: string, chunk: Buffer): string =>
-      buf.length >= MAX_CAPTURED_OUTPUT_BYTES ? buf : buf + chunk.toString("utf8");
-
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout = appendBounded(stdout, chunk);
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr = appendBounded(stderr, chunk);
-    });
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, timeoutMs);
-
-    const settle = (output: RunLocalTestsOutput) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolvePromise(output);
-    };
-
-    child.on("error", (err) => {
-      settle({
-        exitCode: null,
-        stdout: sanitizeSensitiveOutput(stdout),
-        stderr: sanitizeSensitiveOutput(
-          stderr + `\n[run_process] Failed to spawn "${command}": ${String(err)}`
-        ),
-        timedOut: false,
-        durationMs: Date.now() - startedAt,
+      const startedAt = Date.now();
+      const spawnTarget = resolveSpawnTarget(command);
+      const child = spawn(spawnTarget.command, args, {
+        cwd,
+        shell: spawnTarget.shell,
+        env: spawnEnv,
       });
-    });
+      registerChildProcess(child, label, isDocker);
 
-    child.on("close", (code) => {
-      settle({
-        exitCode: code,
-        stdout: sanitizeSensitiveOutput(stdout),
-        stderr: sanitizeSensitiveOutput(stderr),
-        timedOut,
-        durationMs: Date.now() - startedAt,
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      let settled = false;
+
+      const appendBounded = (buf: string, chunk: Buffer): string =>
+        buf.length >= MAX_CAPTURED_OUTPUT_BYTES ? buf : buf + chunk.toString("utf8");
+
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdout = appendBounded(stdout, chunk);
       });
-    });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderr = appendBounded(stderr, chunk);
+      });
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, timeoutMs);
+
+      const settle = (output: RunLocalTestsOutput) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolvePromise(output);
+      };
+
+      child.on("error", (err) => {
+        settle({
+          exitCode: null,
+          stdout: sanitizeSensitiveOutput(stdout),
+          stderr: sanitizeSensitiveOutput(
+            stderr + `\n[run_process] Failed to spawn "${command}": ${String(err)}`
+          ),
+          timedOut: false,
+          durationMs: Date.now() - startedAt,
+        });
+      });
+
+      child.on("close", (code) => {
+        settle({
+          exitCode: code,
+          stdout: sanitizeSensitiveOutput(stdout),
+          stderr: sanitizeSensitiveOutput(stderr),
+          timedOut,
+          durationMs: Date.now() - startedAt,
+        });
+      });
+    })();
   });
 }
 
@@ -517,7 +635,11 @@ export function createRunLocalTestsTool(sandboxRoot: string) {
 const ClaudeCodeEscalationInputSchema = z.object({
   instructions: z.string().min(1),
   timeoutMs: z.number().int().positive().max(600_000).default(300_000),
-  extraArgs: z.array(z.string()).default(["--dangerously-skip-permissions"]),
+  // Non-interactive flags are always injected by buildClaudeCodeCliArgs (--print, permission bypass).
+  // Claude Code CLI does not support --yes/-y; those aliases are stripped if supplied.
+  extraArgs: z
+    .array(z.string())
+    .default(["--permission-mode", "bypassPermissions", "--dangerously-skip-permissions"]),
   docker: DockerSandboxOptionsSchema.nullable().default(null),
 });
 
@@ -529,30 +651,57 @@ export interface ClaudeCodeEscalationOutput {
   readonly durationMs: number;
 }
 
-const CLAUDE_CODE_BINARY = "claude";
 
 export function createClaudeCodeEscalationTool(sandboxRoot: string) {
   assertSandboxRootIsContained(sandboxRoot);
   return tool({
-    description: "LAST-RESORT: invokes Claude Code CLI inside the sandbox to resolve deadlocks.",
+    description:
+      "LAST-RESORT: invokes Claude Code CLI inside the sandbox. Requires `claude` on PATH (npm i -g @anthropic-ai/claude-code) and ANTHROPIC_API_KEY.",
     inputSchema: ClaudeCodeEscalationInputSchema,
     execute: async ({ instructions, timeoutMs, extraArgs, docker }): Promise<ClaudeCodeEscalationOutput> => {
+      const availability = await checkClaudeCodeAvailability();
+      if (!availability.available) {
+        return {
+          exitCode: 127,
+          stdout: "",
+          stderr: `[execute_claude_code_escalation] Claude Code unavailable: ${availability.reason ?? "unknown"}`,
+          timedOut: false,
+          durationMs: 0,
+        };
+      }
+
       const absoluteSandboxRoot = resolveSandboxPath(sandboxRoot, ".");
-      const baseArgs = ["--print", instructions, ...extraArgs];
+      const baseArgs = buildClaudeCodeCliArgs(instructions, extraArgs);
       const containerName = `mams-escalation-${Date.now()}`;
+      const binary = availability.binary;
+      const claudeSpawnEnv = buildClaudeCodeSpawnEnv();
+      const containerEnv = { ...buildClaudeCodeContainerEnv() };
+      if (claudeSpawnEnv.ANTHROPIC_API_KEY && !containerEnv.ANTHROPIC_API_KEY) {
+        containerEnv.ANTHROPIC_API_KEY = claudeSpawnEnv.ANTHROPIC_API_KEY;
+      }
 
       const invocation = docker
-        ? buildDockerInvocation(absoluteSandboxRoot, ".", docker, CLAUDE_CODE_BINARY, baseArgs, containerName)
-        : { command: CLAUDE_CODE_BINARY, args: baseArgs };
+        ? buildDockerInvocation(
+            absoluteSandboxRoot,
+            ".",
+            docker,
+            binary,
+            baseArgs,
+            containerName,
+            containerEnv
+          )
+        : { command: binary, args: baseArgs };
 
-      return runProcess(
+      const result = await runProcess(
         invocation.command,
         invocation.args,
         absoluteSandboxRoot,
         timeoutMs,
         "execute_claude_code_escalation",
-        Boolean(docker)
+        Boolean(docker),
+        claudeSpawnEnv
       );
+      return result;
     },
   });
 }
@@ -653,7 +802,7 @@ async function runNpmInstall(cwd: string, label: string): Promise<void> {
   }
   const result = await runProcess(
     "npm",
-    ["install", "--no-audit", "--no-fund"],
+    ["install", "--ignore-scripts", "--no-audit", "--no-fund"],
     cwd,
     600_000,
     label
