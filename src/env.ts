@@ -17,6 +17,10 @@ export const MamsEnvSchema = z
     GITHUB_REPO_URL: z.string().url(),
     MAMS_FISCAL_BUDGET_LIMIT_USD: z.coerce.number().positive().default(10),
     MAMS_DEFAULT_DEADLINE_MS: z.coerce.number().int().positive().default(3_600_000),
+    MAMS_AUTO_APPROVE_BLUEPRINT: z
+      .enum(["true", "false"])
+      .default("true")
+      .transform((value) => value === "true"),
   })
   .refine(
     (env) =>

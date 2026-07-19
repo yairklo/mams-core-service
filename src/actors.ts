@@ -17,6 +17,7 @@ import {
   type AgentId,
   asAgentId,
   computeStepId,
+  type ExecutionTier,
   type LlmProvider,
   type LlmRoutingConfig,
   type MamsConfig,
@@ -163,19 +164,29 @@ export function buildToolsForRole(role: AgentRole, sandboxRoot: string) {
   const full = createToolSet(sandboxRoot);
   switch (role) {
     case "CODER":
-      return { write_file: full.write_file, read_file: full.read_file, run_local_tests: full.run_local_tests };
+      return {
+        write_file: full.write_file,
+        read_file: full.read_file,
+        list_changed_files: full.list_changed_files,
+        run_local_tests: full.run_local_tests,
+      };
     case "ARCHITECT":
-      return { write_file: full.write_file, read_file: full.read_file };
+      return { write_file: full.write_file, read_file: full.read_file, list_changed_files: full.list_changed_files };
     case "SUPERVISOR":
       return {
         read_file: full.read_file,
+        list_changed_files: full.list_changed_files,
         run_local_tests: full.run_local_tests,
         execute_claude_code_escalation: full.execute_claude_code_escalation,
       };
     case "TESTER":
     case "QA":
     case "SPEC_REVIEWER":
-      return { read_file: full.read_file, run_local_tests: full.run_local_tests };
+      return {
+        read_file: full.read_file,
+        list_changed_files: full.list_changed_files,
+        run_local_tests: full.run_local_tests,
+      };
   }
 }
 
@@ -414,7 +425,7 @@ export interface ExecuteAgentTurnOptions extends RunAgentOptions {
 const DEFAULT_MAX_TOOL_ROUNDTRIPS = 8;
 const MAX_PRIOR_STEP_SUMMARY_CHARS = 2_000;
 
-export function resolveMaxToolRoundtripsForRole(role: AgentRole): number {
+export function resolveMaxToolRoundtripsForRole(role: AgentRole, executionTier?: ExecutionTier): number {
   switch (role) {
     case "TESTER":
     case "QA":
@@ -424,6 +435,10 @@ export function resolveMaxToolRoundtripsForRole(role: AgentRole): number {
     case "SUPERVISOR":
       return 6;
     case "CODER":
+      if (executionTier === "TIER3_CRITICAL" || executionTier === "TIER4_ENTERPRISE_E2E") {
+        return 12;
+      }
+      return DEFAULT_MAX_TOOL_ROUNDTRIPS;
     default:
       return DEFAULT_MAX_TOOL_ROUNDTRIPS;
   }

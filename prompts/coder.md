@@ -38,12 +38,16 @@ requirements for that task.
 
 ## Git (handled by orchestrator on DONE)
 
-Do not run git commands yourself. When the task reaches `DONE`, the
-orchestrator inspects your file changes and the Task Contract to create a
-descriptive branch (for example `mams/mobile-i18n-he-<id>`) and a conventional
-commit message with a clear subject and body. Focus on correct code changes
-inside the workspace only.
+Do not run git commands yourself. When the task reaches `DONE`, the orchestrator inspects
+your **meaningful** file changes (excluding lockfiles) and the Task Contract to create a
+descriptive branch and conventional commit.
 
-In your turn summary, state exactly which files and symbols you changed and
-what you verified with `run_local_tests`. That summary is included in the
-commit body — vague summaries produce vague commits.
+## Required before ending your turn
+
+1. Make at least one successful `write_file` change under `server/` and/or `mobile_app/`
+   (cross-stack tasks usually need both).
+2. Run `list_changed_files` to confirm your edits are tracked — not just lockfiles.
+3. Run `run_local_tests` for affected packages and report the actual command output.
+4. In your summary, list every file path and symbol/key you changed.
+
+Vague summaries produce vague commits. Lockfile-only changes are rejected.

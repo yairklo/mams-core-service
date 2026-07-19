@@ -12,8 +12,10 @@ import { randomUUID } from "node:crypto";
 import { loadMamsEnv } from "./env.js";
 import { PrismaFiscalBudgetLedger, StateMachine } from "./fsmEngine.js";
 import { disconnectDatabase } from "./database.js";
-import { runTaskOrchestration } from "./router.js";
+import { runTaskOrchestration } from "./orchestration.js";
+import { AGENT_WORKSPACES_BASE_DIR, assertSandboxRootIsContained } from "./tools.js";
 import { asSessionId, asTaskId } from "./types.js";
+import { join } from "node:path";
 
 const DEFAULT_OBJECTIVE =
   "Smoke test: verify MAMS can clone the JoinUp repo, install dependencies, and orchestrate a Tier 2 task.";
@@ -53,7 +55,7 @@ async function runInProcess(objective: string): Promise<void> {
   });
 
   console.log(`[smoke] Task created — starting orchestration...`);
-  await runTaskOrchestration(sm, taskId);
+  await runTaskOrchestration(sm, taskId, assertSandboxRootIsContained(join(AGENT_WORKSPACES_BASE_DIR, taskId)));
 
   const finalState = await sm.getTaskState(taskId);
   console.log("[smoke] Final task state:");

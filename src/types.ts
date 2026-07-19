@@ -137,12 +137,26 @@ export function tierUsesSandbox(tier: ExecutionTier): boolean {
   return tier !== "TIER1_FAST_TRACK";
 }
 
+/** Cross-stack / multi-file features should run ARCHITECT + blueprint. */
+export function tierNeedsArchitectureAlignment(tier: ExecutionTier): boolean {
+  return tier === "TIER3_CRITICAL" || tier === "TIER4_ENTERPRISE_E2E";
+}
+
+export type ArchitectureAlignmentStatus =
+  | "not_required"
+  | "required"
+  | "ready"
+  | "approved";
+
+export type AwaitingApprovalKind = "blueprint" | "qa";
+
 // =====================================================================
 // 3. TASK STATUS
 // =====================================================================
 
 export const TASK_STATUSES = [
   "PENDING",
+  "ARCHITECTING",
   "PLANNING",
   "SPEC_REVIEW",
   "EXECUTING",
@@ -229,6 +243,11 @@ export interface TaskState {
   readonly preferredProvider: LlmProvider;
   /** When set, overrides role-based model tiering for all subsequent turns. */
   readonly modelOverride: string | null;
+  /** Context Assessment / blueprint orchestration. */
+  readonly architectureAlignmentStatus: ArchitectureAlignmentStatus;
+  readonly blueprintStepIndex: number;
+  readonly blueprintTotalSteps: number;
+  readonly awaitingApprovalKind: AwaitingApprovalKind | null;
 }
 
 export function nextStepIndex(state: TaskState): number {
@@ -291,6 +310,10 @@ export type TaskSignal =
   | { readonly kind: "FUSE_TRIPPED"; readonly reason: string }
   | { readonly kind: "APPROVAL_GRANTED"; readonly by: string }
   | { readonly kind: "APPROVAL_DENIED"; readonly by: string }
+  | { readonly kind: "DELIVERABLE_REJECTED"; readonly reason: string }
+  | { readonly kind: "ARCHITECTURE_REQUIRED" }
+  | { readonly kind: "ARCHITECTURE_ARTIFACTS_READY"; readonly totalSteps: number }
+  | { readonly kind: "BLUEPRINT_STEP_ADVANCED"; readonly stepIndex: number; readonly totalSteps: number }
   | { readonly kind: "TOOL_CIRCUIT_OPEN"; readonly toolName: string; readonly argsHash: string }
   | {
       readonly kind: "CLOUD_VERIFICATION_RESULT";
@@ -364,6 +387,12 @@ const TaskStateSchema = z.object({
   cloudVerification: CloudVerificationRecordSchema.nullable().default(null),
   preferredProvider: z.enum(["GOOGLE", "ANTHROPIC"]).default("GOOGLE"),
   modelOverride: z.string().min(1).nullable().default(null),
+  architectureAlignmentStatus: z
+    .enum(["not_required", "required", "ready", "approved"])
+    .default("not_required"),
+  blueprintStepIndex: z.number().int().nonnegative().default(0),
+  blueprintTotalSteps: z.number().int().nonnegative().default(0),
+  awaitingApprovalKind: z.enum(["blueprint", "qa"]).nullable().default(null),
 });
 
 export type TaskStateParseResult =

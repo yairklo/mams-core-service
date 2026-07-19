@@ -8,7 +8,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copyAgentSystemAssets.js",
     "start": "node dist/server.js",
-    "dev": "tsx watch src/server.ts",
+    "dev": "node --env-file=.env ./node_modules/tsx/dist/cli.mjs src/server.ts",
+    "dev:watch": "node --env-file=.env ./node_modules/tsx/dist/cli.mjs watch src/server.ts",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate deploy",

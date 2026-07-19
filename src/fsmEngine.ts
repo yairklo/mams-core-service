@@ -13,9 +13,11 @@ import {
 } from "./actors.js";
 import { appendExecutionLog, getFiscalSpend, loadTaskState, recordFiscalSpend, saveTaskState } from "./database.js";
 import { estimateTurnCostUsd } from "./pricing.js";
+import { readBlueprintSteps } from "./tools.js";
 import {
   isTerminalStatus,
   nextStepIndex,
+  tierNeedsArchitectureAlignment,
   tierNeedsCloudVerification,
   tierNeedsQa,
   tierNeedsSelfCritique,
@@ -172,7 +174,15 @@ class KeyedAsyncMutex<K> {
 }
 
 function isStepResultSuccessful(result: StepResult): boolean {
-  return result.toolCalls.every((call) => call.result.ok);
+  return result.toolCalls.length === 0 || result.toolCalls.every((call) => call.result.ok);
+}
+
+function blueprintHasRemainingSteps(state: TaskState): boolean {
+  return state.blueprintTotalSteps > 0 && state.blueprintStepIndex + 1 < state.blueprintTotalSteps;
+}
+
+function blueprintIsComplete(state: TaskState): boolean {
+  return state.blueprintTotalSteps === 0 || state.blueprintStepIndex + 1 >= state.blueprintTotalSteps;
 }
 
 const OPTIMIZABLE_STATUSES: ReadonlySet<TaskStatus> = new Set([
@@ -224,6 +234,74 @@ const TRANSITION_TABLE: readonly Transition[] = [
     from: "PENDING",
     to: "PLANNING",
     guard: (state, signal) => signal.kind === "START" && !tierSkipsPlanning(state.executionTier),
+  },
+
+  // --- ARCHITECTURE ALIGNMENT ---
+  {
+    from: "EXECUTING",
+    to: "ARCHITECTING",
+    guard: (_state, signal) => signal.kind === "ARCHITECTURE_REQUIRED",
+    apply: () => ({ architectureAlignmentStatus: "required" as const }),
+  },
+  {
+    from: "ARCHITECTING",
+    to: "ARCHITECTING",
+    guard: (_state, signal) => signal.kind === "STEP_RESULT" && isStepResultSuccessful(signal.result),
+  },
+  {
+    from: "ARCHITECTING",
+    to: "AWAITING_APPROVAL",
+    guard: (_state, signal) => signal.kind === "ARCHITECTURE_ARTIFACTS_READY",
+    apply: (_state, signal) =>
+      signal.kind === "ARCHITECTURE_ARTIFACTS_READY"
+        ? {
+            architectureAlignmentStatus: "ready" as const,
+            awaitingApprovalKind: "blueprint" as const,
+            blueprintTotalSteps: signal.totalSteps,
+            blueprintStepIndex: 0,
+          }
+        : {},
+  },
+  {
+    from: "ARCHITECTING",
+    to: "ESCALATED",
+    guard: (_state, signal) => signal.kind === "STEP_RESULT" && !isStepResultSuccessful(signal.result),
+  },
+  {
+    from: "AWAITING_APPROVAL",
+    to: "EXECUTING",
+    guard: (state, signal) =>
+      signal.kind === "APPROVAL_GRANTED" && state.awaitingApprovalKind === "blueprint",
+    apply: () => ({
+      architectureAlignmentStatus: "approved" as const,
+      awaitingApprovalKind: null,
+      blueprintStepIndex: 0,
+    }),
+  },
+
+  {
+    from: "DONE",
+    to: "ESCALATED",
+    guard: (_state, signal) => signal.kind === "DELIVERABLE_REJECTED",
+  },
+
+  // --- DELIVERABLE REJECTION ---
+  {
+    from: "*",
+    to: "ESCALATED",
+    guard: (state, signal) =>
+      signal.kind === "DELIVERABLE_REJECTED" && state.status !== "ESCALATED" && state.status !== "DONE",
+  },
+
+  // --- BLUEPRINT mid-execution ---
+  {
+    from: "EXECUTING",
+    to: "EXECUTING",
+    guard: (state, signal) =>
+      signal.kind === "STEP_RESULT" &&
+      isStepResultSuccessful(signal.result) &&
+      blueprintHasRemainingSteps(state),
+    apply: (state) => ({ blueprintStepIndex: state.blueprintStepIndex + 1 }),
   },
 
   // --- PLANNING (TIER3/4) ---
@@ -285,7 +363,8 @@ const TRANSITION_TABLE: readonly Transition[] = [
       signal.kind === "STEP_RESULT" &&
       isStepResultSuccessful(signal.result) &&
       !tierNeedsSelfCritique(state.executionTier) &&
-      state.executionTier !== "TIER1_FAST_TRACK",
+      state.executionTier !== "TIER1_FAST_TRACK" &&
+      blueprintIsComplete(state),
   },
   {
     from: "EXECUTING",
@@ -540,6 +619,12 @@ export function createInitialTaskState(options: CreateTaskOptions): TaskState {
     cloudVerification: null,
     preferredProvider: options.preferredProvider ?? "GOOGLE",
     modelOverride: options.modelOverride ?? null,
+    architectureAlignmentStatus: tierNeedsArchitectureAlignment(options.executionTier)
+      ? "required"
+      : "not_required",
+    blueprintStepIndex: 0,
+    blueprintTotalSteps: 0,
+    awaitingApprovalKind: null,
   };
 }
 
@@ -556,6 +641,8 @@ const DEFAULT_MAX_STEPS_PER_TASK = 200;
 /** Maps FSM status + tier to the agent persona the orchestrator should invoke. */
 export function resolveAgentRoleForStatus(state: TaskState): AgentRole | null {
   switch (state.status) {
+    case "ARCHITECTING":
+      return "ARCHITECT";
     case "PLANNING":
     case "EXECUTING":
     case "SELF_CRITIQUE":
@@ -565,6 +652,9 @@ export function resolveAgentRoleForStatus(state: TaskState): AgentRole | null {
     case "VERIFYING":
       return "TESTER";
     case "AWAITING_APPROVAL":
+      if (state.awaitingApprovalKind === "blueprint") {
+        return null;
+      }
       return tierNeedsQa(state.executionTier) ? "QA" : null;
     case "OPTIMIZING":
       return "SUPERVISOR";
@@ -633,13 +723,14 @@ export class StateMachine {
       priorSteps,
       sandboxRoot,
       pmContext: state.pmContext,
+      ...(state.blueprintTotalSteps > 0 ? { blueprintStepIndex: state.blueprintStepIndex } : {}),
     };
 
     const result = await runAgent(role, taskId, stepIndex, context, {
       preferredProvider: state.preferredProvider,
       modelOverride: state.modelOverride,
       useSandbox,
-      maxToolRoundtrips: options.maxToolRoundtrips ?? resolveMaxToolRoundtripsForRole(role),
+      maxToolRoundtrips: options.maxToolRoundtrips ?? resolveMaxToolRoundtripsForRole(role, state.executionTier),
       ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
     });
 

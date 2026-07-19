@@ -9,7 +9,14 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { TaskId } from "./types.js";
-import { buildGitMetadata, parseChangedPathsFromPorcelain } from "./gitMetadata.js";
+import { buildGitMetadata } from "./gitMetadata.js";
+import {
+  buildFallbackBranchName,
+  collectWorkspaceChanges,
+  hasMeaningfulSourceChanges,
+  resetLockfileDrift,
+  type GitProcessRunner,
+} from "./workspaceGit.js";
 import { tool } from "ai";
 import { z } from "zod";
 import { loadMamsEnv, MamsEnvSchema, type MamsEnv } from "./env.js";
@@ -550,9 +557,37 @@ export function createClaudeCodeEscalationTool(sandboxRoot: string) {
   });
 }
 
+export function createListChangedFilesTool(sandboxRoot: string) {
+  assertSandboxRootIsContained(sandboxRoot);
+  return tool({
+    description:
+      "Lists changed files in the workspace (meaningful source paths only; excludes lockfiles and node_modules).",
+    inputSchema: z.object({}).default({}),
+    execute: async (): Promise<{ readonly paths: readonly string[]; readonly meaningfulOnly: true }> => {
+      const realRoot = assertSandboxRootIsContained(sandboxRoot);
+      const changes = await collectWorkspaceChanges(createSandboxGitRunner(realRoot));
+      return { paths: changes.meaningfulPaths, meaningfulOnly: true };
+    },
+  });
+}
+
+export function createSandboxGitRunner(cwd: string): GitProcessRunner {
+  return {
+    run: async (args, label, timeoutMs = 120_000) => {
+      const result = await runProcess("git", args, cwd, timeoutMs, label);
+      return {
+        exitCode: result.exitCode,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      };
+    },
+  };
+}
+
 export interface ToolSet {
   readonly write_file: ReturnType<typeof createWriteFileTool>;
   readonly read_file: ReturnType<typeof createReadFileTool>;
+  readonly list_changed_files: ReturnType<typeof createListChangedFilesTool>;
   readonly run_local_tests: ReturnType<typeof createRunLocalTestsTool>;
   readonly execute_claude_code_escalation: ReturnType<typeof createClaudeCodeEscalationTool>;
 }
@@ -561,6 +596,7 @@ export function createToolSet(sandboxRoot: string): ToolSet {
   return {
     write_file: createWriteFileTool(sandboxRoot),
     read_file: createReadFileTool(sandboxRoot),
+    list_changed_files: createListChangedFilesTool(sandboxRoot),
     run_local_tests: createRunLocalTestsTool(sandboxRoot),
     execute_claude_code_escalation: createClaudeCodeEscalationTool(sandboxRoot),
   };
@@ -646,6 +682,8 @@ export async function runPostCloneNpmInstall(workspaceRoot: string): Promise<voi
     await runNpmInstall(target, `npm_install_${basename(target)}`);
     console.log(`[workspace] npm install succeeded in "${target}".`);
   }
+
+  await resetLockfileDrift(workspaceRoot, createSandboxGitRunner(workspaceRoot));
 }
 
 async function branchNeedsPush(cwd: string, branch: string, token: string): Promise<boolean> {
@@ -682,6 +720,7 @@ export interface GitFinalizeResult {
   readonly branch: string;
   readonly committed: boolean;
   readonly pushed: boolean;
+  readonly meaningfulPaths?: readonly string[];
   readonly skippedReason?: string;
 }
 
@@ -707,6 +746,30 @@ export async function initializeGitWorkspace(sandboxRoot: string): Promise<void>
 
   await runGitCommand(["config", "user.name", "MAMS Developer Agent"], realRoot, "git_config_name", 30_000);
   await runGitCommand(["config", "user.email", "agent@mams.local"], realRoot, "git_config_email", 30_000);
+  await maybeSeedProjectRules(realRoot, env.GITHUB_REPO_URL);
+}
+
+const TOOLS_DIR = dirname(fileURLToPath(import.meta.url));
+
+async function maybeSeedProjectRules(sandboxRoot: string, repoUrl: string): Promise<void> {
+  if (!/joinup/i.test(repoUrl)) {
+    return;
+  }
+  const rulesPath = join(sandboxRoot, PROJECT_RULES_FILENAME);
+  if (existsSync(rulesPath)) {
+    return;
+  }
+  const seedCandidates = [
+    join(TOOLS_DIR, "..", "seeds", "joinup-app.mams-rules.md"),
+    join(TOOLS_DIR, "..", "..", "seeds", "joinup-app.mams-rules.md"),
+  ];
+  const seedPath = seedCandidates.find((candidate) => existsSync(candidate));
+  if (!seedPath) {
+    return;
+  }
+  const content = await readFile(seedPath, "utf8");
+  await writeFile(rulesPath, content, "utf8");
+  console.log(`[workspace] Seeded ${PROJECT_RULES_FILENAME} from JoinUp template.`);
 }
 
 export interface GitFinalizeInput {
@@ -738,34 +801,32 @@ export async function finalizeGitWorkspace(
 
   let branch = fallbackBranch;
   try {
-    const statusResult = await runProcess(
-      "git",
-      ["status", "--porcelain"],
-      realRoot,
-      30_000,
-      "git_status"
-    );
-    if (statusResult.exitCode !== 0) {
-      throw new Error(
-        sanitizeSensitiveOutput(`git status failed: ${statusResult.stderr || statusResult.stdout}`)
-      );
+    const gitRunner = createSandboxGitRunner(realRoot);
+    const changes = await collectWorkspaceChanges(gitRunner);
+    const meaningfulPaths = changes.meaningfulPaths;
+
+    if (changes.allPaths.length > 0 && !hasMeaningfulSourceChanges(changes.allPaths)) {
+      logWorkspaceTelemetry("git_finalize_skipped", {
+        taskId,
+        branch: fallbackBranch,
+        skippedReason: "no_meaningful_changes",
+        noisePaths: changes.allPaths.slice(0, 10),
+      });
+      return {
+        branch: fallbackBranch,
+        committed: false,
+        pushed: false,
+        meaningfulPaths,
+        skippedReason: "no_meaningful_changes",
+      };
     }
 
-    const changedPaths = parseChangedPathsFromPorcelain(statusResult.stdout);
-    const diffResult = await runProcess(
-      "git",
-      ["diff", "--no-color"],
-      realRoot,
-      30_000,
-      "git_diff"
-    );
-    const diffText = diffResult.exitCode === 0 ? diffResult.stdout : "";
     const gitMetadata = buildGitMetadata({
       taskId,
       objective: input.objective,
       acceptanceCriteria: input.acceptanceCriteria,
-      changedPaths,
-      diffText,
+      changedPaths: meaningfulPaths.length > 0 ? meaningfulPaths : changes.allPaths,
+      diffText: changes.diffText,
       coderSummary: input.coderSummary ?? null,
     });
     branch = gitMetadata.branch;
@@ -776,17 +837,32 @@ export async function finalizeGitWorkspace(
       await runGitCommand(["checkout", branch], realRoot, "git_checkout_existing");
     }
 
-    const hasUncommittedChanges = statusResult.stdout.trim().length > 0;
+    const hasUncommittedChanges = changes.allPaths.length > 0;
     let committed = false;
 
-    if (hasUncommittedChanges) {
-      await runGitCommand(["add", "."], realRoot, "git_add");
+    if (hasUncommittedChanges && meaningfulPaths.length > 0) {
+      for (const path of meaningfulPaths) {
+        await runGitCommand(["add", "--", path], realRoot, "git_add_path");
+      }
       await runGitCommand(
         ["commit", "-m", gitMetadata.commit.subject, "-m", gitMetadata.commit.body],
         realRoot,
         "git_commit"
       );
       committed = true;
+    } else if (hasUncommittedChanges) {
+      logWorkspaceTelemetry("git_finalize_skipped", {
+        taskId,
+        branch,
+        skippedReason: "only_noise_changes",
+      });
+      return {
+        branch,
+        committed: false,
+        pushed: false,
+        meaningfulPaths,
+        skippedReason: "only_noise_changes",
+      };
     }
 
     const needsPush = await branchNeedsPush(realRoot, branch, token);
@@ -818,7 +894,7 @@ export async function finalizeGitWorkspace(
     }
 
     console.log(`[workspace] Pushed branch "${branch}" for task "${taskId}".`);
-    return { branch, committed, pushed: true };
+    return { branch, committed, pushed: true, meaningfulPaths };
   } catch (err) {
     logWorkspaceTelemetry("git_finalize_failed", {
       taskId,

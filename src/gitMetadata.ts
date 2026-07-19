@@ -1,8 +1,20 @@
 import type { TaskId } from "./types.js";
+import {
+  filterMeaningfulPaths,
+  normalizeRepoPath,
+  slugifyBranchSegment,
+} from "./workspaceGit.js";
 
 const MAX_BRANCH_SLUG_LEN = 48;
 const BRANCH_PREFIX = "mams";
 const MAX_SUBJECT_LEN = 72;
+
+const FEATURE_KEYWORDS: readonly { readonly pattern: RegExp; readonly slug: string }[] = [
+  { pattern: /notification|notify|push|alert|התרא/i, slug: "notifications" },
+  { pattern: /join(?:ed|s|ing)?|הצטרפ/i, slug: "game-join" },
+  { pattern: /chat|message|הודע/i, slug: "chat" },
+  { pattern: /i18n|locale|translation|תרגום/i, slug: "i18n" },
+];
 
 const HEBREW_ACTION_TO_ENGLISH: Readonly<Record<string, string>> = {
   "להחליף": "rename",
@@ -11,6 +23,7 @@ const HEBREW_ACTION_TO_ENGLISH: Readonly<Record<string, string>> = {
   "למחוק": "remove",
   "לתקן": "fix",
   "לעדכן": "update",
+  "הוספת": "add",
 };
 
 export interface GitMetadataInput {
@@ -33,37 +46,17 @@ export interface GitMetadata {
   readonly commit: GitCommitMessage;
 }
 
-/** Parses `git status --porcelain` paths (pre-add). */
-export function parseChangedPathsFromPorcelain(porcelain: string): string[] {
-  const paths: string[] = [];
-  for (const line of porcelain.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed.length < 4) {
-      continue;
-    }
-    const pathPart = trimmed.slice(3).trim();
-    if (!pathPart) {
-      continue;
-    }
-    const renamed = pathPart.includes(" -> ") ? (pathPart.split(" -> ").pop() ?? pathPart) : pathPart;
-    paths.push(renamed.replace(/\\/g, "/"));
-  }
-  return [...new Set(paths)];
-}
-
-export function slugifyBranchSegment(input: string): string {
-  const slug = input
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, MAX_BRANCH_SLUG_LEN);
-  return slug.length > 0 ? slug : "change";
+export function slugifyForGit(input: string): string {
+  return slugifyBranchSegment(input.slice(0, MAX_BRANCH_SLUG_LEN));
 }
 
 function shortTaskSuffix(taskId: TaskId): string {
   return taskId.replace(/-/g, "").slice(0, 8);
+}
+
+function hasSignificantAscii(text: string): boolean {
+  const ascii = text.replace(/[^\x20-\x7E]/g, " ").replace(/\s+/g, " ").trim();
+  return ascii.length >= 12;
 }
 
 function inferHebrewAction(objective: string): string | null {
@@ -75,26 +68,37 @@ function inferHebrewAction(objective: string): string | null {
   return null;
 }
 
-function extractQuotedStrings(text: string): string[] {
-  const matches = [...text.matchAll(/["'""]([^"'""]+)["'""]/g)];
-  return matches.map((match) => match[1]?.trim() ?? "").filter((value) => value.length > 0);
+function inferFeatureSlug(objective: string, acceptanceCriteria: readonly string[]): string | null {
+  const corpus = [objective, ...acceptanceCriteria].join("\n");
+  for (const { pattern, slug } of FEATURE_KEYWORDS) {
+    if (pattern.test(corpus)) {
+      return slug;
+    }
+  }
+  return null;
 }
 
 function slugFromChangedPaths(changedPaths: readonly string[]): string | null {
-  if (changedPaths.length === 0) {
+  const meaningful = filterMeaningfulPaths(changedPaths.map(normalizeRepoPath));
+  if (meaningful.length === 0) {
     return null;
   }
 
-  const normalized = changedPaths.map((path) => path.replace(/\\/g, "/"));
+  const normalized = meaningful.map(normalizeRepoPath);
   const localePath = normalized.find((path) => /locales?\/[^/]+\.(json|ya?ml)$/i.test(path));
   if (localePath) {
     const locale = localePath.match(/locales?\/([^/.]+)\./i)?.[1] ?? "locale";
     const area = normalized.some((path) => /mobile/i.test(path)) ? "mobile" : "app";
-    return slugifyBranchSegment(`${area}-i18n-${locale}`);
+    return slugifyForGit(`${area}-i18n-${locale}`);
   }
 
-  if (normalized.some((path) => /i18n|translation|locale/i.test(path))) {
-    return slugifyBranchSegment("i18n-update");
+  const featureFromPaths = normalized.some((p) => /notification/i.test(p))
+    ? "notifications"
+    : normalized.some((p) => /chat|message/i.test(p))
+      ? "chat"
+      : null;
+  if (featureFromPaths) {
+    return slugifyForGit(`feat-${featureFromPaths}`);
   }
 
   const primary = normalized[0] ?? "";
@@ -102,17 +106,18 @@ function slugFromChangedPaths(changedPaths: readonly string[]): string | null {
     .split("/")
     .filter((segment) => segment.length > 0 && !["src", "dist", "lib", "app"].includes(segment.toLowerCase()));
   const tail = segments.slice(-2).join("-");
-  return tail ? slugifyBranchSegment(tail) : null;
+  return tail ? slugifyForGit(tail) : null;
 }
 
-function slugFromObjective(objective: string): string | null {
-  const action = inferHebrewAction(objective);
-  const quoted = extractQuotedStrings(objective);
-  if (action && quoted.length >= 2) {
-    return slugifyBranchSegment(`${action}-label`);
+function slugFromObjective(objective: string, acceptanceCriteria: readonly string[]): string | null {
+  const feature = inferFeatureSlug(objective, acceptanceCriteria);
+  if (feature) {
+    return slugifyForGit(`feat-${feature}`);
   }
+
+  const action = inferHebrewAction(objective);
   if (action) {
-    return slugifyBranchSegment(action);
+    return slugifyForGit(action);
   }
 
   const asciiWords = objective
@@ -122,44 +127,54 @@ function slugFromObjective(objective: string): string | null {
     .filter((word) => word.length > 2)
     .slice(0, 5);
   if (asciiWords.length > 0) {
-    return slugifyBranchSegment(asciiWords.join("-"));
+    return slugifyForGit(asciiWords.join("-"));
   }
   return null;
 }
 
-export function buildBranchName(taskId: TaskId, objective: string, changedPaths: readonly string[]): string {
-  const slug = slugFromChangedPaths(changedPaths) ?? slugFromObjective(objective) ?? "change";
+export function buildBranchName(
+  taskId: TaskId,
+  objective: string,
+  acceptanceCriteria: readonly string[],
+  changedPaths: readonly string[]
+): string {
+  const meaningful = filterMeaningfulPaths(changedPaths);
+  const slug =
+    slugFromChangedPaths(meaningful.length > 0 ? meaningful : changedPaths) ??
+    slugFromObjective(objective, acceptanceCriteria) ??
+    "change";
   return `${BRANCH_PREFIX}/${slug}-${shortTaskSuffix(taskId)}`;
 }
 
 function inferCommitType(changedPaths: readonly string[]): string {
-  if (changedPaths.some((path) => /locales?|i18n|translation/i.test(path))) {
+  const paths = filterMeaningfulPaths(changedPaths);
+  if (paths.some((path) => /locales?|i18n|translation/i.test(path))) {
     return "fix";
   }
-  if (changedPaths.some((path) => /test|spec|__tests__/i.test(path))) {
+  if (paths.some((path) => /test|spec|__tests__/i.test(path))) {
     return "test";
   }
-  if (changedPaths.some((path) => /\.md$/i.test(path) || /\/docs\//i.test(path))) {
+  if (paths.some((path) => /\.md$/i.test(path) || /\/docs\//i.test(path))) {
     return "docs";
-  }
-  if (changedPaths.some((path) => /package\.json|lock\.json|pnpm-lock|yarn\.lock/i.test(path))) {
-    return "chore";
   }
   return "feat";
 }
 
 function inferCommitScope(changedPaths: readonly string[]): string {
-  if (changedPaths.some((path) => /mobile_app|mobile-app/i.test(path))) {
+  const paths = filterMeaningfulPaths(changedPaths);
+  const hasMobile = paths.some((path) => /mobile_app|mobile-app/i.test(path));
+  const hasServer = paths.some((path) => /(?:^|\/)server(?:\/|$)/i.test(path));
+  if (hasMobile && hasServer) {
+    return "app";
+  }
+  if (hasMobile) {
     return "mobile";
   }
-  if (changedPaths.some((path) => /(?:^|\/)server(?:\/|$)/i.test(path))) {
+  if (hasServer) {
     return "server";
   }
-  if (changedPaths.some((path) => /next_app|next-app/i.test(path))) {
+  if (paths.some((path) => /next_app|next-app/i.test(path))) {
     return "web";
-  }
-  if (changedPaths.some((path) => /locales?|i18n/i.test(path))) {
-    return "i18n";
   }
   return "mams";
 }
@@ -177,13 +192,31 @@ function extractChangedKeyFromDiff(diffText?: string): string | null {
   return null;
 }
 
-function buildCommitSubject(input: GitMetadataInput): string {
-  const type = inferCommitType(input.changedPaths);
-  const scope = inferCommitScope(input.changedPaths);
-  const keyHint = extractChangedKeyFromDiff(input.diffText);
-  const localePath = input.changedPaths.find((path) => /locales?\/[^/]+\./i.test(path));
-  const locale = localePath?.match(/locales?\/([^/.]+)\./i)?.[1];
+function summarizeAcceptanceCriterion(criterion: string): string {
+  const cleaned = criterion.replace(/\s+/g, " ").trim();
+  if (cleaned.length <= 60) {
+    return cleaned;
+  }
+  return `${cleaned.slice(0, 57)}...`;
+}
 
+function buildCommitSubject(input: GitMetadataInput): string {
+  const meaningful = filterMeaningfulPaths(input.changedPaths);
+  const paths = meaningful.length > 0 ? meaningful : input.changedPaths;
+  const type = inferCommitType(paths);
+  const scope = inferCommitScope(paths);
+  const feature = inferFeatureSlug(input.objective, input.acceptanceCriteria);
+
+  if (feature === "notifications" || feature === "game-join") {
+    return `${type}(${scope}): notify owner when player joins game`;
+  }
+  if (feature === "chat") {
+    return `${type}(${scope}): add direct chat actions for joined players`;
+  }
+
+  const keyHint = extractChangedKeyFromDiff(input.diffText);
+  const localePath = paths.find((path) => /locales?\/[^/]+\./i.test(path));
+  const locale = localePath?.match(/locales?\/([^/.]+)\./i)?.[1];
   if (locale && keyHint) {
     return `${type}(${scope}): update ${locale} ${keyHint} label`;
   }
@@ -191,37 +224,47 @@ function buildCommitSubject(input: GitMetadataInput): string {
     return `${type}(${scope}): update ${locale} UI strings`;
   }
 
-  const asciiObjective = input.objective.replace(/[^\x20-\x7E]/g, " ").replace(/\s+/g, " ").trim();
-  if (asciiObjective.length >= 12) {
+  const englishCriterion = input.acceptanceCriteria.find((c) => hasSignificantAscii(c));
+  if (englishCriterion) {
+    return `${type}(${scope}): ${summarizeAcceptanceCriterion(englishCriterion)}`;
+  }
+
+  if (hasSignificantAscii(input.objective)) {
+    const asciiObjective = input.objective.replace(/[^\x20-\x7E]/g, " ").replace(/\s+/g, " ").trim();
     return `${type}(${scope}): ${asciiObjective.slice(0, MAX_SUBJECT_LEN - type.length - scope.length - 4)}`;
   }
 
   const action = inferHebrewAction(input.objective);
-  const quoted = extractQuotedStrings(input.objective);
-  if (action === "rename" && quoted.length >= 2) {
-    return `${type}(${scope}): rename homepage label text`;
+  if (action === "add" && feature) {
+    return `${type}(${scope}): add ${feature.replace(/-/g, " ")} feature`;
   }
   if (action) {
     return `${type}(${scope}): ${action} per task objective`;
   }
 
-  const primaryFile = input.changedPaths[0]?.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "files";
-  return `${type}(${scope}): update ${primaryFile}`;
+  return `${type}(${scope}): implement task objective`;
 }
 
 export function buildCommitMessage(input: GitMetadataInput): GitCommitMessage {
-  const subject = buildCommitSubject(input).slice(0, MAX_SUBJECT_LEN);
+  const meaningful = filterMeaningfulPaths(input.changedPaths);
+  const pathsForBody = meaningful.length > 0 ? meaningful : input.changedPaths;
+  const subject = buildCommitSubject({ ...input, changedPaths: pathsForBody }).slice(0, MAX_SUBJECT_LEN);
   const bodyLines: string[] = [];
 
-  if (input.changedPaths.length > 0) {
+  if (pathsForBody.length > 0) {
     bodyLines.push("Changes:");
-    for (const path of input.changedPaths.slice(0, 12)) {
+    for (const path of pathsForBody.slice(0, 12)) {
       bodyLines.push(`- ${path}`);
     }
   }
 
-  const objectiveLine = input.acceptanceCriteria[0] ?? input.objective;
-  bodyLines.push("", "Task objective:", objectiveLine);
+  bodyLines.push("", "Task objective:", input.objective);
+  if (input.acceptanceCriteria.length > 0) {
+    bodyLines.push("", "Acceptance criteria:");
+    for (const criterion of input.acceptanceCriteria.slice(0, 6)) {
+      bodyLines.push(`- ${criterion}`);
+    }
+  }
 
   if (input.coderSummary?.trim()) {
     bodyLines.push("", "Implementation notes:", input.coderSummary.trim().slice(0, 800));
@@ -232,8 +275,10 @@ export function buildCommitMessage(input: GitMetadataInput): GitCommitMessage {
 }
 
 export function buildGitMetadata(input: GitMetadataInput): GitMetadata {
+  const meaningful = filterMeaningfulPaths(input.changedPaths);
+  const pathsForMeta = meaningful.length > 0 ? meaningful : input.changedPaths;
   return {
-    branch: buildBranchName(input.taskId, input.objective, input.changedPaths),
-    commit: buildCommitMessage(input),
+    branch: buildBranchName(input.taskId, input.objective, input.acceptanceCriteria, pathsForMeta),
+    commit: buildCommitMessage({ ...input, changedPaths: pathsForMeta }),
   };
 }

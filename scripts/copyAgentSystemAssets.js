@@ -9,3 +9,10 @@ const dest = path.join(projectRoot, "dist", "prompts");
 
 fs.cpSync(src, dest, { recursive: true });
 console.log(`[copyAgentSystemAssets] Copied "${src}" -> "${dest}"`);
+
+const seedsSrc = path.join(projectRoot, "seeds");
+const seedsDest = path.join(projectRoot, "dist", "seeds");
+if (fs.existsSync(seedsSrc)) {
+  fs.cpSync(seedsSrc, seedsDest, { recursive: true });
+  console.log(`[copyAgentSystemAssets] Copied "${seedsSrc}" -> "${seedsDest}"`);
+}
