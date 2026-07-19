@@ -130,7 +130,8 @@ async function loadGenerateContentModels(): Promise<readonly string[]> {
   try {
     return await fetchGenerateContentModels(apiKey);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    const message = rawMessage.replaceAll(apiKey, "[REDACTED]");
     console.warn(`[googleModelResolver] ListModels request failed — using static fallbacks: ${message}`);
     return [];
   }

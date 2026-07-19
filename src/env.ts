@@ -19,8 +19,14 @@ export const MamsEnvSchema = z
     MAMS_DEFAULT_DEADLINE_MS: z.coerce.number().int().positive().default(3_600_000),
   })
   .refine(
-    (env) => Boolean(env.GEMINI_API_KEY?.trim()) || Boolean(env.ANTHROPIC_API_KEY?.trim()),
-    { message: "At least one of GEMINI_API_KEY or ANTHROPIC_API_KEY must be set (non-empty)." }
+    (env) =>
+      Boolean(env.GEMINI_API_KEY?.trim()) ||
+      Boolean(env.GOOGLE_GENERATIVE_AI_API_KEY?.trim()) ||
+      Boolean(env.ANTHROPIC_API_KEY?.trim()),
+    {
+      message:
+        "At least one of GEMINI_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, or ANTHROPIC_API_KEY must be set (non-empty).",
+    }
   );
 
 export type MamsEnv = z.infer<typeof MamsEnvSchema>;
