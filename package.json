@@ -1,0 +1,35 @@
+{
+  "name": "mams-core-service",
+  "version": "1.0.0",
+  "description": "Standalone Multi-Agent Management System (MAMS) microservice",
+  "private": true,
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copyAgentSystemAssets.js",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate deploy",
+    "postinstall": "prisma generate"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^2.0.87",
+    "@ai-sdk/google": "^2.0.82",
+    "@prisma/client": "^6.14.0",
+    "ai": "^5.0.216",
+    "express": "^4.21.2",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^20.19.43",
+    "prisma": "^6.14.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
