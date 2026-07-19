@@ -39,6 +39,11 @@ requirements for that task.
 ## Git (handled by orchestrator on DONE)
 
 Do not run git commands yourself. When the task reaches `DONE`, the
-orchestrator automatically creates branch `mams/task-<taskId>`, commits your
-sandbox changes, and pushes to GitHub. Focus on correct code changes inside
-the workspace only.
+orchestrator inspects your file changes and the Task Contract to create a
+descriptive branch (for example `mams/mobile-i18n-he-<id>`) and a conventional
+commit message with a clear subject and body. Focus on correct code changes
+inside the workspace only.
+
+In your turn summary, state exactly which files and symbols you changed and
+what you verified with `run_local_tests`. That summary is included in the
+commit body — vague summaries produce vague commits.

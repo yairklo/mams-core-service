@@ -9,6 +9,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { TaskId } from "./types.js";
+import { buildGitMetadata, parseChangedPathsFromPorcelain } from "./gitMetadata.js";
 import { tool } from "ai";
 import { z } from "zod";
 import { loadMamsEnv, MamsEnvSchema, type MamsEnv } from "./env.js";
@@ -267,20 +268,57 @@ const ReadFileInputSchema = z.object({
   path: z.string().min(1),
 });
 
+/** Keep tool payloads small — each read is re-sent on every subsequent LLM step. */
+export const MAX_READ_FILE_CHARS = 48_000;
+
 export interface ReadFileOutput {
   readonly path: string;
   readonly content: string;
+  readonly truncated?: boolean;
+  readonly totalChars?: number;
+}
+
+function isBlockedReadPath(relativePath: string): string | null {
+  const normalized = relativePath.replace(/\\/g, "/").replace(/^\.\/+/, "").toLowerCase();
+  if (
+    normalized.startsWith("node_modules/") ||
+    normalized.includes("/node_modules/") ||
+    normalized.startsWith(".git/") ||
+    normalized.includes("/.git/")
+  ) {
+    return "Refusing to read dependency or VCS internals (node_modules/, .git/). Target source files instead.";
+  }
+  return null;
+}
+
+function truncateReadFileContent(content: string): Pick<ReadFileOutput, "content" | "truncated" | "totalChars"> {
+  const totalChars = content.length;
+  if (totalChars <= MAX_READ_FILE_CHARS) {
+    return { content, totalChars };
+  }
+  return {
+    content:
+      content.slice(0, MAX_READ_FILE_CHARS) +
+      `\n\n[TRUNCATED: showing first ${MAX_READ_FILE_CHARS} of ${totalChars} characters. Use a narrower path or run_local_tests instead of reading huge files.]`,
+    truncated: true,
+    totalChars,
+  };
 }
 
 export function createReadFileTool(sandboxRoot: string) {
   assertSandboxRootIsContained(sandboxRoot);
   return tool({
-    description: "Reads a UTF-8 text file within the task sandbox.",
+    description: `Reads a UTF-8 text file within the task sandbox (max ${MAX_READ_FILE_CHARS} chars; node_modules/ and .git/ blocked).`,
     inputSchema: ReadFileInputSchema,
     execute: async ({ path }): Promise<ReadFileOutput> => {
+      const blockedReason = isBlockedReadPath(path);
+      if (blockedReason) {
+        return { path, content: blockedReason, truncated: false, totalChars: blockedReason.length };
+      }
       const absolutePath = resolveSandboxPath(sandboxRoot, path);
-      const content = await readFile(absolutePath, "utf8");
-      return { path, content };
+      const raw = await readFile(absolutePath, "utf8");
+      const { content, truncated, totalChars } = truncateReadFileContent(raw);
+      return { path, content, ...(truncated !== undefined ? { truncated } : {}), ...(totalChars !== undefined ? { totalChars } : {}) };
     },
   });
 }
@@ -357,6 +395,29 @@ function buildDockerInvocation(
   };
 }
 
+function resolveSpawnTarget(command: string): { readonly command: string; readonly shell: boolean } {
+  if (process.platform === "win32" && (command === "npm" || command === "npx")) {
+    return { command, shell: true };
+  }
+  return { command, shell: false };
+}
+
+/** Ensures Node's install directory is on PATH for child processes (Windows npm.cmd). */
+function buildSpawnEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  if (process.platform !== "win32") {
+    return env;
+  }
+  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "Path";
+  const nodeBinDir = dirname(process.execPath);
+  const currentPath = env[pathKey] ?? "";
+  const pathEntries = currentPath.split(";").map((entry) => entry.trim().toLowerCase());
+  if (!pathEntries.includes(nodeBinDir.toLowerCase())) {
+    env[pathKey] = currentPath ? `${currentPath};${nodeBinDir}` : nodeBinDir;
+  }
+  return env;
+}
+
 function runProcess(
   command: string,
   args: readonly string[],
@@ -367,7 +428,12 @@ function runProcess(
 ): Promise<RunLocalTestsOutput> {
   return new Promise((resolvePromise) => {
     const startedAt = Date.now();
-    const child = spawn(command, args, { cwd, shell: false });
+    const spawnTarget = resolveSpawnTarget(command);
+    const child = spawn(spawnTarget.command, args, {
+      cwd,
+      shell: spawnTarget.shell,
+      env: buildSpawnEnv(),
+    });
     registerChildProcess(child, label, isDocker);
 
     let stdout = "";
@@ -643,6 +709,12 @@ export async function initializeGitWorkspace(sandboxRoot: string): Promise<void>
   await runGitCommand(["config", "user.email", "agent@mams.local"], realRoot, "git_config_email", 30_000);
 }
 
+export interface GitFinalizeInput {
+  readonly objective: string;
+  readonly acceptanceCriteria: readonly string[];
+  readonly coderSummary?: string | null;
+}
+
 /**
  * On successful task completion: branch, commit, and push agent changes to GitHub.
  * Failures are logged to telemetry; callers may catch and continue.
@@ -650,26 +722,22 @@ export async function initializeGitWorkspace(sandboxRoot: string): Promise<void>
 export async function finalizeGitWorkspace(
   taskId: TaskId,
   sandboxRoot: string,
-  objective: string
+  input: GitFinalizeInput
 ): Promise<GitFinalizeResult> {
   const env = loadMamsEnv();
   const realRoot = assertSandboxRootIsContained(sandboxRoot);
-  const branch = `mams/task-${taskId}`;
   const token = env.GITHUB_AUTH_TOKEN;
+
+  const fallbackBranch = `mams/change-${taskId.replace(/-/g, "").slice(0, 8)}`;
 
   if (!existsSync(join(realRoot, ".git"))) {
     const skippedReason = "no_git_repository";
-    logWorkspaceTelemetry("git_finalize_skipped", { taskId, branch, skippedReason });
-    return { branch, committed: false, pushed: false, skippedReason };
+    logWorkspaceTelemetry("git_finalize_skipped", { taskId, branch: fallbackBranch, skippedReason });
+    return { branch: fallbackBranch, committed: false, pushed: false, skippedReason };
   }
 
+  let branch = fallbackBranch;
   try {
-    try {
-      await runGitCommand(["checkout", "-b", branch], realRoot, "git_checkout_branch");
-    } catch {
-      await runGitCommand(["checkout", branch], realRoot, "git_checkout_existing");
-    }
-
     const statusResult = await runProcess(
       "git",
       ["status", "--porcelain"],
@@ -683,12 +751,41 @@ export async function finalizeGitWorkspace(
       );
     }
 
+    const changedPaths = parseChangedPathsFromPorcelain(statusResult.stdout);
+    const diffResult = await runProcess(
+      "git",
+      ["diff", "--no-color"],
+      realRoot,
+      30_000,
+      "git_diff"
+    );
+    const diffText = diffResult.exitCode === 0 ? diffResult.stdout : "";
+    const gitMetadata = buildGitMetadata({
+      taskId,
+      objective: input.objective,
+      acceptanceCriteria: input.acceptanceCriteria,
+      changedPaths,
+      diffText,
+      coderSummary: input.coderSummary ?? null,
+    });
+    branch = gitMetadata.branch;
+
+    try {
+      await runGitCommand(["checkout", "-b", branch], realRoot, "git_checkout_branch");
+    } catch {
+      await runGitCommand(["checkout", branch], realRoot, "git_checkout_existing");
+    }
+
     const hasUncommittedChanges = statusResult.stdout.trim().length > 0;
     let committed = false;
 
     if (hasUncommittedChanges) {
       await runGitCommand(["add", "."], realRoot, "git_add");
-      await runGitCommand(["commit", "-m", "feat(mams): auto-implemented objective"], realRoot, "git_commit");
+      await runGitCommand(
+        ["commit", "-m", gitMetadata.commit.subject, "-m", gitMetadata.commit.body],
+        realRoot,
+        "git_commit"
+      );
       committed = true;
     }
 
@@ -714,7 +811,7 @@ export async function finalizeGitWorkspace(
       logWorkspaceTelemetry("git_push_failed", {
         taskId,
         branch,
-        objective: objective.slice(0, 200),
+        objective: input.objective.slice(0, 200),
         error: pushErr instanceof Error ? pushErr.message : String(pushErr),
       });
       return { branch, committed, pushed: false, skippedReason: "push_failed" };

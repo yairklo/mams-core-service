@@ -3,7 +3,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,7 +34,7 @@ export { PROJECT_RULES_FILENAME, PROJECT_RULES_SECTION_HEADER };
 
 export type AgentRole = "CODER" | "TESTER" | "QA" | "SPEC_REVIEWER" | "SUPERVISOR" | "ARCHITECT";
 
-const HEAVY_ROLES: ReadonlySet<AgentRole> = new Set(["CODER", "TESTER", "SUPERVISOR", "ARCHITECT"]);
+const HEAVY_ROLES: ReadonlySet<AgentRole> = new Set(["CODER", "SUPERVISOR", "ARCHITECT"]);
 
 const ANTHROPIC_MODEL_BY_TIER = {
   heavy: "claude-3-5-sonnet-20241022",
@@ -57,7 +57,13 @@ const PROMPT_FILENAME_BY_ROLE: Readonly<Record<AgentRole, string>> = {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const PROMPTS_DIR = join(__dirname, "prompts");
+const PROMPTS_DIR = (() => {
+  const distPrompts = join(__dirname, "prompts");
+  if (existsSync(distPrompts)) {
+    return distPrompts;
+  }
+  return join(__dirname, "..", "prompts");
+})();
 
 export class MissingPersonaPromptError extends Error {
   public override readonly name = "MissingPersonaPromptError";
@@ -241,7 +247,7 @@ async function buildUserPrompt(role: AgentRole, context: AgentTaskContext): Prom
   if (priorSteps.length > 0) {
     const isVerifierRole = role === "TESTER" || role === "QA" || role === "SPEC_REVIEWER";
     const historyLines = priorSteps.map(
-      (step, i) => `${i + 1}. [${step.agentId}] ${step.narrativeSummary}`
+      (step, i) => `${i + 1}. [${step.agentId}] ${truncateNarrativeSummary(step.narrativeSummary)}`
     );
     sections.push(
       [
@@ -405,7 +411,44 @@ export interface ExecuteAgentTurnOptions extends RunAgentOptions {
   readonly suppressStepTransition?: boolean;
 }
 
-const DEFAULT_MAX_TOOL_ROUNDTRIPS = 12;
+const DEFAULT_MAX_TOOL_ROUNDTRIPS = 8;
+const MAX_PRIOR_STEP_SUMMARY_CHARS = 2_000;
+
+export function resolveMaxToolRoundtripsForRole(role: AgentRole): number {
+  switch (role) {
+    case "TESTER":
+    case "QA":
+    case "SPEC_REVIEWER":
+      return 5;
+    case "ARCHITECT":
+    case "SUPERVISOR":
+      return 6;
+    case "CODER":
+    default:
+      return DEFAULT_MAX_TOOL_ROUNDTRIPS;
+  }
+}
+
+export function resolveAgentTurnTimeoutMsForRole(role: AgentRole): number {
+  switch (role) {
+    case "TESTER":
+    case "QA":
+    case "SPEC_REVIEWER":
+      return 180_000;
+    case "CODER":
+    case "ARCHITECT":
+      return 300_000;
+    default:
+      return 240_000;
+  }
+}
+
+function truncateNarrativeSummary(summary: string): string {
+  if (summary.length <= MAX_PRIOR_STEP_SUMMARY_CHARS) {
+    return summary;
+  }
+  return `${summary.slice(0, MAX_PRIOR_STEP_SUMMARY_CHARS)}... [truncated ${summary.length - MAX_PRIOR_STEP_SUMMARY_CHARS} chars]`;
+}
 
 export async function runAgent(
   role: AgentRole,
@@ -429,14 +472,29 @@ export async function runAgent(
   const tools = options.useSandbox === false ? undefined : buildToolsForRole(role, context.sandboxRoot);
 
   const stepId = computeStepId(taskId, stepIndex, { role, modelId, objective: context.contract.objective });
+  const maxToolRoundtrips = options.maxToolRoundtrips ?? resolveMaxToolRoundtripsForRole(role);
+  const timeoutMs = resolveAgentTurnTimeoutMsForRole(role);
+  const abortController = new AbortController();
+  const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
 
-  const result = await generateText({
-    model,
-    system,
-    prompt,
-    ...(tools ? { tools } : {}),
-    stopWhen: stepCountIs(options.maxToolRoundtrips ?? DEFAULT_MAX_TOOL_ROUNDTRIPS),
-  });
+  let result;
+  try {
+    result = await generateText({
+      model,
+      system,
+      prompt,
+      ...(tools ? { tools } : {}),
+      stopWhen: stepCountIs(maxToolRoundtrips),
+      abortSignal: abortController.signal,
+    });
+  } catch (err) {
+    if (abortController.signal.aborted) {
+      throw new Error(`Agent turn timed out after ${timeoutMs}ms (${role}).`, { cause: err });
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
 
   const activity = collectToolActivity(result.steps);
   const toolCalls = toStepResultToolCalls(activity, stepId, agentId);

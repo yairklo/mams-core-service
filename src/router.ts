@@ -28,6 +28,7 @@ import {
   type CloudVerificationStatus,
   type LlmProvider,
   type PmContext,
+  type StepResult,
   type TaskId,
 } from "./types.js";
 
@@ -207,7 +208,7 @@ export async function handleCloudWebhook(
 }
 
 export async function runTaskOrchestration(sm: StateMachine, taskId: TaskId): Promise<void> {
-  const priorSteps: never[] = [];
+  const priorSteps: StepResult[] = [];
   const sandboxRoot = sandboxPathForTask(taskId);
   const maxIterations = 250;
 
@@ -228,7 +229,13 @@ export async function runTaskOrchestration(sm: StateMachine, taskId: TaskId): Pr
     if (isTerminalStatus(state.status)) {
       if (state.status === "DONE" && tierUsesSandbox(state.executionTier)) {
         try {
-          const gitResult = await finalizeGitWorkspace(taskId, sandboxRoot, state.contract.objective);
+          const coderSummary =
+            [...priorSteps].reverse().find((step) => step.agentId.includes("coder"))?.narrativeSummary ?? null;
+          const gitResult = await finalizeGitWorkspace(taskId, sandboxRoot, {
+            objective: state.contract.objective,
+            acceptanceCriteria: state.contract.acceptanceCriteria,
+            coderSummary,
+          });
           console.log(`[orchestrator] Git finalize for "${taskId}":`, gitResult);
         } catch (err) {
           console.error(`[orchestrator] Git finalize failed for "${taskId}":`, err);
@@ -255,7 +262,8 @@ export async function runTaskOrchestration(sm: StateMachine, taskId: TaskId): Pr
     }
 
     try {
-      await sm.executeAgentTurn(taskId, role, sandboxRoot, priorSteps);
+      const { stepResult } = await sm.executeAgentTurn(taskId, role, sandboxRoot, priorSteps);
+      priorSteps.push(stepResult);
     } catch (err) {
       if (err instanceof InvalidTransitionError) {
         console.error(`[orchestrator] Invalid transition for "${taskId}":`, err.message);

@@ -3,7 +3,14 @@
  * Tier-aware transition routing is the single source of truth for execution graphs.
  */
 
-import { type AgentRole, type AgentTaskContext, type RunAgentOptions, resolveModelIdForRole, runAgent } from "./actors.js";
+import {
+  type AgentRole,
+  type AgentTaskContext,
+  type RunAgentOptions,
+  resolveMaxToolRoundtripsForRole,
+  resolveModelIdForRole,
+  runAgent,
+} from "./actors.js";
 import { appendExecutionLog, getFiscalSpend, loadTaskState, recordFiscalSpend, saveTaskState } from "./database.js";
 import { estimateTurnCostUsd } from "./pricing.js";
 import {
@@ -612,7 +619,7 @@ export class StateMachine {
     sandboxRoot: string,
     priorSteps: readonly StepResult[] = [],
     options: RunAgentOptions = {}
-  ): Promise<TaskState> {
+  ): Promise<{ readonly state: TaskState; readonly stepResult: StepResult }> {
     const state = await this.getTaskState(taskId);
     const stepIndex = nextStepIndex(state);
     const { modelId, provider } = await resolveModelIdForRole(role, {
@@ -632,7 +639,7 @@ export class StateMachine {
       preferredProvider: state.preferredProvider,
       modelOverride: state.modelOverride,
       useSandbox,
-      ...(options.maxToolRoundtrips !== undefined ? { maxToolRoundtrips: options.maxToolRoundtrips } : {}),
+      maxToolRoundtrips: options.maxToolRoundtrips ?? resolveMaxToolRoundtripsForRole(role),
       ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
     });
 
@@ -659,7 +666,8 @@ export class StateMachine {
       );
     }
 
-    return this.dispatch(taskId, { kind: "STEP_RESULT", stepId: result.stepId, result });
+    const nextState = await this.dispatch(taskId, { kind: "STEP_RESULT", stepId: result.stepId, result });
+    return { state: nextState, stepResult: result };
   }
 
   private async checkHardStops(state: TaskState): Promise<TaskSignal | null> {
