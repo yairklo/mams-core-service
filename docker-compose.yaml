@@ -6,7 +6,7 @@
 #
 # Usage:
 #   docker compose up --build -d
-#   curl http://localhost:8080/health
+#   curl http://localhost:8082/health
 
 services:
   postgres:
@@ -34,7 +34,7 @@ services:
     mem_limit: 1200m
     mem_reservation: 600m
     ports:
-      - "8080:8080"
+      - "8082:8080"
     env_file:
       - .env
     environment:
