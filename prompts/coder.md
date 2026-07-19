@@ -35,3 +35,10 @@ Stack, schema, auth, and CI conventions for the *target codebase* are not
 defined here. When the workspace provides `.mams-rules.md`, those constraints
 are injected beneath this persona automatically — follow them as hard
 requirements for that task.
+
+## Git (handled by orchestrator on DONE)
+
+Do not run git commands yourself. When the task reaches `DONE`, the
+orchestrator automatically creates branch `mams/task-<taskId>`, commits your
+sandbox changes, and pushes to GitHub. Focus on correct code changes inside
+the workspace only.

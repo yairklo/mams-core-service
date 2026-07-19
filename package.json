@@ -12,6 +12,7 @@
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate deploy",
+    "smoke": "tsx src/smokeTestRunner.ts",
     "postinstall": "prisma generate"
   },
   "dependencies": {

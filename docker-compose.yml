@@ -1,0 +1,63 @@
+# MAMS Core Service — production stack
+#
+# Prerequisites:
+#   cp .env.example .env
+#   Fill ANTHROPIC_API_KEY (required for Claude Code CLI), GITHUB_* , and optional GEMINI_API_KEY
+#
+# Usage:
+#   docker compose up --build -d
+#   curl http://localhost:8080/health
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mams
+      POSTGRES_PASSWORD: mams
+      POSTGRES_DB: mams_db
+    volumes:
+      - mams-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mams -d mams_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  mams:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    cpus: 1.2
+    mem_limit: 1200m
+    mem_reservation: 600m
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      # Override host-local DB URL when running inside Compose network
+      MAMS_DATABASE_URL: postgresql://mams:mams@postgres:5432/mams_db?schema=public
+      # Claude Code CLI authenticates headlessly via Anthropic Console API key
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GITHUB_AUTH_TOKEN: ${GITHUB_AUTH_TOKEN}
+      GITHUB_REPO_URL: ${GITHUB_REPO_URL}
+      MAMS_FISCAL_BUDGET_LIMIT_USD: ${MAMS_FISCAL_BUDGET_LIMIT_USD:-10}
+      MAMS_DEFAULT_DEADLINE_MS: ${MAMS_DEFAULT_DEADLINE_MS:-3600000}
+    volumes:
+      # Persistent Claude Code session/config cache (headless state)
+      - claude-config:/home/mams/.claude
+      # Isolated per-task git workspaces (clone, npm install, agent edits)
+      - mams-workspaces:/app/workspaces
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  claude-config:
+  mams-workspaces:
+  mams-postgres-data:

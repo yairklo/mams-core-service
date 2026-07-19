@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import type { TaskId } from "./types.js";
 import { tool } from "ai";
 import { z } from "zod";
 import { loadMamsEnv, MamsEnvSchema, type MamsEnv } from "./env.js";
@@ -34,6 +35,54 @@ export class SandboxRootViolationError extends Error {
       `Refusing sandbox root "${attemptedRoot}": it does not resolve inside "${AGENT_WORKSPACES_BASE_DIR}".`
     );
   }
+}
+
+export class DependencyInstallError extends Error {
+  public override readonly name = "DependencyInstallError";
+
+  constructor(
+    public readonly installPath: string,
+    message: string,
+    public readonly exitCode: number | null = null
+  ) {
+    super(message);
+  }
+}
+
+/** Strips PATs and token-bearing URLs from process output before logging or throwing. */
+export function sanitizeSensitiveOutput(text: string): string {
+  let sanitized = text;
+  try {
+    const env = loadMamsEnv();
+    if (env.GITHUB_AUTH_TOKEN.length >= 4) {
+      sanitized = sanitized.replaceAll(env.GITHUB_AUTH_TOKEN, "[REDACTED]");
+    }
+  } catch {
+    const token = process.env.GITHUB_AUTH_TOKEN;
+    if (token && token.length >= 4) {
+      sanitized = sanitized.replaceAll(token, "[REDACTED]");
+    }
+  }
+  sanitized = sanitized.replace(/https:\/\/[^\s/@]+@/gi, "https://[REDACTED]@");
+  sanitized = sanitized.replace(
+    /Authorization:\s*Basic\s+[A-Za-z0-9+/=]+/gi,
+    "Authorization: Basic [REDACTED]"
+  );
+  return sanitized;
+}
+
+function buildCleanGitRepoUrl(repoUrl: string): string {
+  const parsed = new URL(repoUrl);
+  if (parsed.protocol !== "https:") {
+    throw new Error(`GITHUB_REPO_URL must use HTTPS; got "${parsed.protocol}".`);
+  }
+  return `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}${parsed.hash}`;
+}
+
+/** In-memory GitHub HTTPS auth — never persisted to `.git/config`. */
+function gitHttpAuthConfigArgs(token: string): readonly string[] {
+  const basic = Buffer.from(`x-access-token:${token}`, "utf8").toString("base64");
+  return ["-c", `http.extraHeader=Authorization: Basic ${basic}`];
 }
 
 /** Resolves symlinks via realpathSync; creates missing leaf directories first. */
@@ -244,15 +293,23 @@ function runProcess(
     child.on("error", (err) => {
       settle({
         exitCode: null,
-        stdout,
-        stderr: stderr + `\n[run_process] Failed to spawn "${command}": ${String(err)}`,
+        stdout: sanitizeSensitiveOutput(stdout),
+        stderr: sanitizeSensitiveOutput(
+          stderr + `\n[run_process] Failed to spawn "${command}": ${String(err)}`
+        ),
         timedOut: false,
         durationMs: Date.now() - startedAt,
       });
     });
 
     child.on("close", (code) => {
-      settle({ exitCode: code, stdout, stderr, timedOut, durationMs: Date.now() - startedAt });
+      settle({
+        exitCode: code,
+        stdout: sanitizeSensitiveOutput(stdout),
+        stderr: sanitizeSensitiveOutput(stderr),
+        timedOut,
+        durationMs: Date.now() - startedAt,
+      });
     });
   });
 }
@@ -336,7 +393,7 @@ export function createToolSet(sandboxRoot: string): ToolSet {
   };
 }
 
-/** Builds an authenticated HTTPS clone URL for headless VPS git operations. */
+/** @deprecated Prefer buildCleanGitRepoUrl + gitHttpAuthConfigArgs — never persist tokens in git config. */
 export function buildAuthenticatedGitCloneUrl(repoUrl: string, token: string): string {
   const parsed = new URL(repoUrl);
   if (parsed.protocol !== "https:") {
@@ -354,10 +411,105 @@ async function runGitCommand(
 ): Promise<void> {
   const result = await runProcess("git", args, cwd, timeoutMs, label);
   if (result.exitCode !== 0) {
+    const detail = sanitizeSensitiveOutput(result.stderr || result.stdout);
     throw new Error(
-      `git ${args.join(" ")} failed (exit ${result.exitCode}): ${result.stderr || result.stdout}`
+      sanitizeSensitiveOutput(`git ${args.join(" ")} failed (exit ${result.exitCode}): ${detail}`)
     );
   }
+}
+
+async function runAuthenticatedGitCommand(
+  token: string,
+  args: readonly string[],
+  cwd: string,
+  label: string,
+  timeoutMs = 120_000
+): Promise<void> {
+  await runGitCommand([...gitHttpAuthConfigArgs(token), ...args], cwd, label, timeoutMs);
+}
+
+function logWorkspaceTelemetry(event: string, payload: Record<string, unknown>): void {
+  const sanitizedPayload = Object.fromEntries(
+    Object.entries(payload).map(([key, value]) => [
+      key,
+      typeof value === "string" ? sanitizeSensitiveOutput(value) : value,
+    ])
+  );
+  console.warn(`[telemetry] ${JSON.stringify({ event, ...sanitizedPayload })}`);
+}
+
+async function runNpmInstall(cwd: string, label: string): Promise<void> {
+  if (!existsSync(join(cwd, "package.json"))) {
+    return;
+  }
+  const result = await runProcess(
+    "npm",
+    ["install", "--no-audit", "--no-fund"],
+    cwd,
+    600_000,
+    label
+  );
+  if (result.exitCode !== 0) {
+    const detail = sanitizeSensitiveOutput(result.stderr || result.stdout).slice(0, 500);
+    throw new DependencyInstallError(
+      cwd,
+      sanitizeSensitiveOutput(`npm install failed (exit ${result.exitCode}): ${detail}`),
+      result.exitCode
+    );
+  }
+}
+
+/** Installs dependencies at workspace root and common monorepo packages (server/, next_app/). */
+export async function runPostCloneNpmInstall(workspaceRoot: string): Promise<void> {
+  const installTargets = [workspaceRoot];
+  for (const subdir of ["server", "next_app"]) {
+    const pkgPath = join(workspaceRoot, subdir, "package.json");
+    if (existsSync(pkgPath)) {
+      installTargets.push(join(workspaceRoot, subdir));
+    }
+  }
+
+  for (const target of installTargets) {
+    await runNpmInstall(target, `npm_install_${basename(target)}`);
+    console.log(`[workspace] npm install succeeded in "${target}".`);
+  }
+}
+
+async function branchNeedsPush(cwd: string, branch: string, token: string): Promise<boolean> {
+  const localResult = await runProcess("git", ["rev-parse", branch], cwd, 30_000, "git_rev_parse");
+  if (localResult.exitCode !== 0) {
+    return true;
+  }
+  const localHash = localResult.stdout.trim();
+  if (!localHash) {
+    return true;
+  }
+
+  const remoteResult = await runProcess(
+    "git",
+    [...gitHttpAuthConfigArgs(token), "ls-remote", "--heads", "origin", branch],
+    cwd,
+    60_000,
+    "git_ls_remote"
+  );
+  if (remoteResult.exitCode !== 0) {
+    return true;
+  }
+
+  const remoteLine = remoteResult.stdout.trim();
+  if (!remoteLine) {
+    return true;
+  }
+
+  const remoteHash = remoteLine.split(/\s+/)[0] ?? "";
+  return remoteHash !== localHash;
+}
+
+export interface GitFinalizeResult {
+  readonly branch: string;
+  readonly committed: boolean;
+  readonly pushed: boolean;
+  readonly skippedReason?: string;
 }
 
 /**
@@ -367,13 +519,108 @@ async function runGitCommand(
 export async function initializeGitWorkspace(sandboxRoot: string): Promise<void> {
   const env = loadMamsEnv();
   const realRoot = assertSandboxRootIsContained(sandboxRoot);
-  const cloneUrl = buildAuthenticatedGitCloneUrl(env.GITHUB_REPO_URL, env.GITHUB_AUTH_TOKEN);
+  const cleanCloneUrl = buildCleanGitRepoUrl(env.GITHUB_REPO_URL);
   const gitDir = join(realRoot, ".git");
 
   if (!existsSync(gitDir)) {
-    await runGitCommand(["clone", cloneUrl, "."], realRoot, "git_clone");
+    await runAuthenticatedGitCommand(
+      env.GITHUB_AUTH_TOKEN,
+      ["clone", cleanCloneUrl, "."],
+      realRoot,
+      "git_clone"
+    );
+    await runPostCloneNpmInstall(realRoot);
   }
 
   await runGitCommand(["config", "user.name", "MAMS Developer Agent"], realRoot, "git_config_name", 30_000);
   await runGitCommand(["config", "user.email", "agent@mams.local"], realRoot, "git_config_email", 30_000);
+}
+
+/**
+ * On successful task completion: branch, commit, and push agent changes to GitHub.
+ * Failures are logged to telemetry; callers may catch and continue.
+ */
+export async function finalizeGitWorkspace(
+  taskId: TaskId,
+  sandboxRoot: string,
+  objective: string
+): Promise<GitFinalizeResult> {
+  const env = loadMamsEnv();
+  const realRoot = assertSandboxRootIsContained(sandboxRoot);
+  const branch = `mams/task-${taskId}`;
+  const token = env.GITHUB_AUTH_TOKEN;
+
+  if (!existsSync(join(realRoot, ".git"))) {
+    const skippedReason = "no_git_repository";
+    logWorkspaceTelemetry("git_finalize_skipped", { taskId, branch, skippedReason });
+    return { branch, committed: false, pushed: false, skippedReason };
+  }
+
+  try {
+    try {
+      await runGitCommand(["checkout", "-b", branch], realRoot, "git_checkout_branch");
+    } catch {
+      await runGitCommand(["checkout", branch], realRoot, "git_checkout_existing");
+    }
+
+    const statusResult = await runProcess(
+      "git",
+      ["status", "--porcelain"],
+      realRoot,
+      30_000,
+      "git_status"
+    );
+    if (statusResult.exitCode !== 0) {
+      throw new Error(
+        sanitizeSensitiveOutput(`git status failed: ${statusResult.stderr || statusResult.stdout}`)
+      );
+    }
+
+    const hasUncommittedChanges = statusResult.stdout.trim().length > 0;
+    let committed = false;
+
+    if (hasUncommittedChanges) {
+      await runGitCommand(["add", "."], realRoot, "git_add");
+      await runGitCommand(["commit", "-m", "feat(mams): auto-implemented objective"], realRoot, "git_commit");
+      committed = true;
+    }
+
+    const needsPush = await branchNeedsPush(realRoot, branch, token);
+    if (!needsPush && !committed) {
+      logWorkspaceTelemetry("git_finalize_skipped", { taskId, branch, skippedReason: "already_synced" });
+      return { branch, committed: false, pushed: true, skippedReason: "already_synced" };
+    }
+
+    if (!needsPush && committed) {
+      return { branch, committed: true, pushed: true, skippedReason: "already_synced" };
+    }
+
+    try {
+      await runAuthenticatedGitCommand(
+        token,
+        ["push", "-u", "origin", branch],
+        realRoot,
+        "git_push",
+        180_000
+      );
+    } catch (pushErr) {
+      logWorkspaceTelemetry("git_push_failed", {
+        taskId,
+        branch,
+        objective: objective.slice(0, 200),
+        error: pushErr instanceof Error ? pushErr.message : String(pushErr),
+      });
+      return { branch, committed, pushed: false, skippedReason: "push_failed" };
+    }
+
+    console.log(`[workspace] Pushed branch "${branch}" for task "${taskId}".`);
+    return { branch, committed, pushed: true };
+  } catch (err) {
+    logWorkspaceTelemetry("git_finalize_failed", {
+      taskId,
+      branch,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
 }

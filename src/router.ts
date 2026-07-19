@@ -14,7 +14,12 @@ import {
   StateMachine,
   type CreateTaskOptions,
 } from "./fsmEngine.js";
-import { AGENT_WORKSPACES_BASE_DIR, assertSandboxRootIsContained, initializeGitWorkspace } from "./tools.js";
+import {
+  AGENT_WORKSPACES_BASE_DIR,
+  assertSandboxRootIsContained,
+  finalizeGitWorkspace,
+  initializeGitWorkspace,
+} from "./tools.js";
 import {
   asSessionId,
   asTaskId,
@@ -201,20 +206,34 @@ export async function handleCloudWebhook(
   return { taskId: next.taskId, status: next.status };
 }
 
-async function runTaskOrchestration(sm: StateMachine, taskId: TaskId): Promise<void> {
+export async function runTaskOrchestration(sm: StateMachine, taskId: TaskId): Promise<void> {
   const priorSteps: never[] = [];
   const sandboxRoot = sandboxPathForTask(taskId);
   const maxIterations = 250;
 
   const initialState = await sm.getTaskState(taskId);
   if (tierUsesSandbox(initialState.executionTier)) {
-    await initializeGitWorkspace(sandboxRoot);
+    try {
+      await initializeGitWorkspace(sandboxRoot);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[orchestrator] Workspace init failed for "${taskId}":`, message);
+      return;
+    }
   }
 
   for (let i = 0; i < maxIterations; i += 1) {
     const state = await sm.getTaskState(taskId);
 
     if (isTerminalStatus(state.status)) {
+      if (state.status === "DONE" && tierUsesSandbox(state.executionTier)) {
+        try {
+          const gitResult = await finalizeGitWorkspace(taskId, sandboxRoot, state.contract.objective);
+          console.log(`[orchestrator] Git finalize for "${taskId}":`, gitResult);
+        } catch (err) {
+          console.error(`[orchestrator] Git finalize failed for "${taskId}":`, err);
+        }
+      }
       console.log(`[orchestrator] Task "${taskId}" reached terminal status "${state.status}".`);
       return;
     }
