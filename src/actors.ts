@@ -11,6 +11,7 @@ import { anthropic } from "@ai-sdk/anthropic";
 import { google } from "@ai-sdk/google";
 import { generateText, stepCountIs, type LanguageModel } from "ai";
 
+import { resolveGoogleModelId } from "./googleModelResolver.js";
 import { estimateTurnCostUsd } from "./pricing.js";
 import {
   type AgentId,
@@ -40,7 +41,7 @@ const ANTHROPIC_MODEL_BY_TIER = {
   light: "claude-3-5-haiku-20241022",
 } as const;
 
-const GOOGLE_MODEL_BY_TIER = {
+const GOOGLE_MODEL_PREFERENCE_BY_TIER = {
   heavy: "gemini-1.5-pro",
   light: "gemini-1.5-flash",
 } as const;
@@ -353,27 +354,30 @@ function routingConfigFrom(config: MamsConfig | LlmRoutingConfig): LlmRoutingCon
 }
 
 /** Resolves provider + model id for a role using tiered routing rules. */
-export function resolveModelIdForRole(
+export async function resolveModelIdForRole(
   role: AgentRole,
   config: MamsConfig | LlmRoutingConfig
-): { readonly provider: LlmProvider; readonly modelId: string } {
+): Promise<{ readonly provider: LlmProvider; readonly modelId: string }> {
   const routing = routingConfigFrom(config);
   const provider = routing.preferredProvider ?? "GOOGLE";
-
-  if (routing.modelOverride) {
-    return { provider, modelId: routing.modelOverride };
-  }
-
   const isHeavy = HEAVY_ROLES.has(role);
+
   if (provider === "ANTHROPIC") {
-    return { provider, modelId: isHeavy ? ANTHROPIC_MODEL_BY_TIER.heavy : ANTHROPIC_MODEL_BY_TIER.light };
+    return {
+      provider,
+      modelId: routing.modelOverride ?? (isHeavy ? ANTHROPIC_MODEL_BY_TIER.heavy : ANTHROPIC_MODEL_BY_TIER.light),
+    };
   }
-  return { provider, modelId: isHeavy ? GOOGLE_MODEL_BY_TIER.heavy : GOOGLE_MODEL_BY_TIER.light };
+
+  const preferred =
+    routing.modelOverride ?? (isHeavy ? GOOGLE_MODEL_PREFERENCE_BY_TIER.heavy : GOOGLE_MODEL_PREFERENCE_BY_TIER.light);
+  const modelId = await resolveGoogleModelId(preferred);
+  return { provider, modelId };
 }
 
 /** Centralized LLM factory — routes to Anthropic or Google based on config and role tier. */
-export function getLLMModel(role: AgentRole, config: MamsConfig): LanguageModel {
-  const { provider, modelId } = resolveModelIdForRole(role, config);
+export async function getLLMModel(role: AgentRole, config: MamsConfig): Promise<LanguageModel> {
+  const { provider, modelId } = await resolveModelIdForRole(role, config);
   if (provider === "ANTHROPIC") {
     return anthropic(modelId);
   }
@@ -381,11 +385,11 @@ export function getLLMModel(role: AgentRole, config: MamsConfig): LanguageModel 
 }
 
 /** @deprecated Use resolveModelIdForRole — retained for telemetry callers expecting a model string. */
-export function resolveModelForRole(role: AgentRole, override?: string): string {
-  return resolveModelIdForRole(role, {
+export async function resolveModelForRole(role: AgentRole, override?: string): Promise<string> {
+  return (await resolveModelIdForRole(role, {
     preferredProvider: "GOOGLE",
     modelOverride: override ?? null,
-  }).modelId;
+  })).modelId;
 }
 
 export interface RunAgentOptions {
@@ -417,8 +421,8 @@ export async function runAgent(
     preferredProvider: options.preferredProvider ?? "GOOGLE",
     modelOverride: options.modelOverride ?? null,
   };
-  const { provider, modelId } = resolveModelIdForRole(role, routingConfig);
-  const model = getLLMModel(role, { executionTier: "TIER1_FAST_TRACK", ...routingConfig });
+  const { provider, modelId } = await resolveModelIdForRole(role, routingConfig);
+  const model = provider === "ANTHROPIC" ? anthropic(modelId) : google(modelId);
 
   const { system } = await compileSystemPrompt(role, context.sandboxRoot, taskId);
   const prompt = await buildUserPrompt(role, context);

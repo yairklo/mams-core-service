@@ -26,7 +26,20 @@ const FALLBACK_RATES: ModelPricingRates = {
 };
 
 export function getModelPricing(modelId: string): ModelPricingRates {
-  return MODEL_PRICING_USD[modelId] ?? FALLBACK_RATES;
+  const direct = MODEL_PRICING_USD[modelId];
+  if (direct) {
+    return direct;
+  }
+
+  const lower = modelId.toLowerCase();
+  if (lower.includes("flash")) {
+    return MODEL_PRICING_USD["gemini-1.5-flash"] ?? FALLBACK_RATES;
+  }
+  if (lower.includes("gemini") && lower.includes("pro")) {
+    return MODEL_PRICING_USD["gemini-1.5-pro"] ?? FALLBACK_RATES;
+  }
+
+  return FALLBACK_RATES;
 }
 
 /** Computes USD cost for a single agent turn from actual token counts and model id. */

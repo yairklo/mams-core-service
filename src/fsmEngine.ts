@@ -615,7 +615,7 @@ export class StateMachine {
   ): Promise<TaskState> {
     const state = await this.getTaskState(taskId);
     const stepIndex = nextStepIndex(state);
-    const { modelId, provider } = resolveModelIdForRole(role, {
+    const { modelId, provider } = await resolveModelIdForRole(role, {
       preferredProvider: options.preferredProvider ?? state.preferredProvider,
       modelOverride: options.modelOverride ?? state.modelOverride,
     });

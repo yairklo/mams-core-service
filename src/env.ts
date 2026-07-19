@@ -11,6 +11,7 @@ export const MamsEnvSchema = z
     MAMS_DATABASE_URL: z.string().min(1),
     PORT: z.coerce.number().int().positive().default(8080),
     GEMINI_API_KEY: z.string().optional(),
+    GOOGLE_GENERATIVE_AI_API_KEY: z.string().optional(),
     ANTHROPIC_API_KEY: z.string().optional(),
     GITHUB_AUTH_TOKEN: z.string().min(1),
     GITHUB_REPO_URL: z.string().url(),
