@@ -34,8 +34,10 @@ RUN npm run build \
 # --- Stage 2: lean runtime ----------------------------------------------------
 FROM node:20-bookworm-slim AS runner
 
+# bookworm-slim omits user-management tools by default — install adduser (provides addgroup/adduser).
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
+    adduser \
     ca-certificates \
     curl \
     git \
@@ -43,16 +45,15 @@ RUN apt-get update \
     python3 \
     make \
     g++ \
+  && addgroup --system --gid 1001 mams \
+  && adduser --system --uid 1001 --ingroup mams --home /home/mams mams \
+  && mkdir -p /app/workspaces /home/mams/.claude /home/mams/.npm-global \
+  && chown -R mams:mams /app /home/mams \
   && rm -rf /var/lib/apt/lists/*
 
 ENV NODE_ENV=production \
     NPM_CONFIG_PREFIX=/home/mams/.npm-global \
     PATH=/home/mams/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
-
-RUN groupadd --system --gid 1001 mams \
-  && useradd --system --uid 1001 --gid mams --create-home --home-dir /home/mams mams \
-  && mkdir -p /app/workspaces /home/mams/.claude /home/mams/.npm-global \
-  && chown -R mams:mams /app /home/mams
 
 WORKDIR /app
 
