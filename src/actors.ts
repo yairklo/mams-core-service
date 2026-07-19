@@ -5,7 +5,8 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { anthropic } from "@ai-sdk/anthropic";
 import { google } from "@ai-sdk/google";
 import { generateText, stepCountIs, type LanguageModel } from "ai";
@@ -26,14 +27,13 @@ import {
   type ToolCallRequest,
   type ToolCallResult,
 } from "./types.js";
-import { createToolSet, resolveSandboxPath } from "./tools.js";
+import { createToolSet, PROJECT_RULES_FILENAME, PROJECT_RULES_SECTION_HEADER, readBlueprintStep, resolveSandboxPath } from "./tools.js";
 
-export const PROJECT_RULES_FILENAME = ".mams-rules.md";
-export const PROJECT_RULES_SECTION_HEADER = "=== TARGET PROJECT ARCHITECTURAL RULES ===";
+export { PROJECT_RULES_FILENAME, PROJECT_RULES_SECTION_HEADER };
 
-export type AgentRole = "CODER" | "TESTER" | "QA" | "SPEC_REVIEWER" | "SUPERVISOR";
+export type AgentRole = "CODER" | "TESTER" | "QA" | "SPEC_REVIEWER" | "SUPERVISOR" | "ARCHITECT";
 
-const HEAVY_ROLES: ReadonlySet<AgentRole> = new Set(["CODER", "TESTER", "SUPERVISOR"]);
+const HEAVY_ROLES: ReadonlySet<AgentRole> = new Set(["CODER", "TESTER", "SUPERVISOR", "ARCHITECT"]);
 
 const ANTHROPIC_MODEL_BY_TIER = {
   heavy: "claude-3-5-sonnet-20241022",
@@ -51,8 +51,11 @@ const PROMPT_FILENAME_BY_ROLE: Readonly<Record<AgentRole, string>> = {
   QA: "qa.md",
   SPEC_REVIEWER: "spec_reviewer.md",
   SUPERVISOR: "supervisor.md",
+  ARCHITECT: "architect.md",
 };
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 const PROMPTS_DIR = join(__dirname, "prompts");
 
 export class MissingPersonaPromptError extends Error {
@@ -154,6 +157,8 @@ export function buildToolsForRole(role: AgentRole, sandboxRoot: string) {
   switch (role) {
     case "CODER":
       return { write_file: full.write_file, read_file: full.read_file, run_local_tests: full.run_local_tests };
+    case "ARCHITECT":
+      return { write_file: full.write_file, read_file: full.read_file };
     case "SUPERVISOR":
       return {
         read_file: full.read_file,
@@ -172,10 +177,12 @@ export interface AgentTaskContext {
   readonly priorSteps: readonly StepResult[];
   readonly sandboxRoot: string;
   readonly pmContext?: PmContext | null;
+  /** When set, CODER focuses on this sequential blueprint step from `task-blueprint.md`. */
+  readonly blueprintStepIndex?: number;
 }
 
-function buildUserPrompt(role: AgentRole, context: AgentTaskContext): string {
-  const { contract, priorSteps, pmContext } = context;
+async function buildUserPrompt(role: AgentRole, context: AgentTaskContext): Promise<string> {
+  const { contract, priorSteps, pmContext, sandboxRoot, blueprintStepIndex } = context;
   const sections: string[] = [];
 
   if (pmContext) {
@@ -205,6 +212,30 @@ function buildUserPrompt(role: AgentRole, context: AgentTaskContext): string {
         : "- (none specified)",
     ].join("\n")
   );
+
+  if (role === "ARCHITECT") {
+    sections.push(
+      [
+        "## Context Assessment Deliverables",
+        `1. Write or enrich \`${PROJECT_RULES_FILENAME}\` with concrete project rules (no placeholders).`,
+        "2. Write `task-blueprint.md` with a numbered, sequential checklist decomposing the objective.",
+        "Use read_file to inspect the repo, then write_file for both artifacts.",
+      ].join("\n")
+    );
+  }
+
+  if (role === "CODER" && blueprintStepIndex !== undefined) {
+    const step = await readBlueprintStep(sandboxRoot, blueprintStepIndex);
+    if (step) {
+      sections.push(
+        [
+          "## Blueprint Step (from task-blueprint.md)",
+          `Step ${blueprintStepIndex + 1}: ${step}`,
+          "Complete ONLY this step in your turn. Do not skip ahead to later blueprint steps.",
+        ].join("\n")
+      );
+    }
+  }
 
   if (priorSteps.length > 0) {
     const isVerifierRole = role === "TESTER" || role === "QA" || role === "SPEC_REVIEWER";
@@ -365,6 +396,11 @@ export interface RunAgentOptions {
   readonly useSandbox?: boolean;
 }
 
+export interface ExecuteAgentTurnOptions extends RunAgentOptions {
+  /** Record telemetry/history without dispatching STEP_RESULT (Context Assessment / mid-blueprint). */
+  readonly suppressStepTransition?: boolean;
+}
+
 const DEFAULT_MAX_TOOL_ROUNDTRIPS = 12;
 
 export async function runAgent(
@@ -385,7 +421,7 @@ export async function runAgent(
   const model = getLLMModel(role, { executionTier: "TIER1_FAST_TRACK", ...routingConfig });
 
   const { system } = await compileSystemPrompt(role, context.sandboxRoot, taskId);
-  const prompt = buildUserPrompt(role, context);
+  const prompt = await buildUserPrompt(role, context);
   const tools = options.useSandbox === false ? undefined : buildToolsForRole(role, context.sandboxRoot);
 
   const stepId = computeStepId(taskId, stepIndex, { role, modelId, objective: context.contract.objective });

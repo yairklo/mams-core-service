@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { TaskId } from "./types.js";
 import { tool } from "ai";
 import { z } from "zod";
@@ -15,7 +16,113 @@ import { registerChildProcess, registerDockerContainerId } from "./processRegist
 
 export { MamsEnvSchema, loadMamsEnv, type MamsEnv };
 
+export const PROJECT_RULES_FILENAME = ".mams-rules.md";
+export const PROJECT_RULES_SECTION_HEADER = "=== TARGET PROJECT ARCHITECTURAL RULES ===";
+export const TASK_BLUEPRINT_FILENAME = "task-blueprint.md";
+
+const PLACEHOLDER_PATTERNS: readonly RegExp[] = [
+  /<!--\s*example/i,
+  /your-org\/your-repo/i,
+  /user:password@localhost/i,
+  /fill in/i,
+  /replace with/i,
+  /todo:/i,
+  /\(none specified\)/i,
+  /<!--\s*\.\.\./i,
+  /example\.com/i,
+];
+
+export interface WorkspaceContextAssessment {
+  readonly requiresArchitectureAlignment: boolean;
+  readonly reason: string;
+}
+
+function isPlaceholderRulesContent(content: string): boolean {
+  const trimmed = content.trim();
+  if (trimmed.length < 120) {
+    return true;
+  }
+  const nonHeadingLines = trimmed
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#") && !line.startsWith(">"));
+  if (nonHeadingLines.length < 3) {
+    return true;
+  }
+  return PLACEHOLDER_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
+/** Context Assessment Phase — inspect `.mams-rules.md` for structural completeness. */
+export async function assessWorkspaceContext(sandboxRoot: string): Promise<WorkspaceContextAssessment> {
+  assertSandboxRootIsContained(sandboxRoot);
+  let rulesPath: string;
+  try {
+    rulesPath = resolveSandboxPath(sandboxRoot, PROJECT_RULES_FILENAME);
+  } catch {
+    return { requiresArchitectureAlignment: true, reason: "rules_path_unavailable" };
+  }
+
+  try {
+    const content = await readFile(rulesPath, "utf8");
+    if (content.trim().length === 0) {
+      return { requiresArchitectureAlignment: true, reason: "rules_empty" };
+    }
+    if (isPlaceholderRulesContent(content)) {
+      return { requiresArchitectureAlignment: true, reason: "rules_placeholder_only" };
+    }
+    return { requiresArchitectureAlignment: false, reason: "rules_substantive" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return { requiresArchitectureAlignment: true, reason: "rules_missing" };
+    }
+    return { requiresArchitectureAlignment: true, reason: "rules_unreadable" };
+  }
+}
+
+/** Parses numbered/checklist steps from `task-blueprint.md`. */
+export async function readBlueprintSteps(sandboxRoot: string): Promise<readonly string[]> {
+  try {
+    const blueprintPath = resolveSandboxPath(sandboxRoot, TASK_BLUEPRINT_FILENAME);
+    const content = await readFile(blueprintPath, "utf8");
+    const steps: string[] = [];
+    for (const line of content.split("\n")) {
+      const match = line.match(/^\s*(?:\d+[\.)]|[-*])\s+(.+)$/);
+      if (match?.[1]) {
+        steps.push(match[1].trim());
+      }
+    }
+    return steps;
+  } catch {
+    return [];
+  }
+}
+
+export async function readBlueprintStep(sandboxRoot: string, stepIndex: number): Promise<string | null> {
+  const steps = await readBlueprintSteps(sandboxRoot);
+  return steps[stepIndex] ?? null;
+}
+
+export async function validateArchitectureArtifacts(sandboxRoot: string): Promise<boolean> {
+  try {
+    const rulesPath = resolveSandboxPath(sandboxRoot, PROJECT_RULES_FILENAME);
+    const blueprintPath = resolveSandboxPath(sandboxRoot, TASK_BLUEPRINT_FILENAME);
+    const [rules, blueprint] = await Promise.all([readFile(rulesPath, "utf8"), readFile(blueprintPath, "utf8")]);
+    const steps = await readBlueprintSteps(sandboxRoot);
+    return (
+      rules.trim().length > 0 &&
+      blueprint.trim().length > 0 &&
+      !isPlaceholderRulesContent(rules) &&
+      steps.length > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
 // From dist/tools.js -> ../workspaces = mams-core-service/workspaces/
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 export const AGENT_WORKSPACES_BASE_DIR = resolve(__dirname, "..", "workspaces");
 mkdirSync(AGENT_WORKSPACES_BASE_DIR, { recursive: true });
 
