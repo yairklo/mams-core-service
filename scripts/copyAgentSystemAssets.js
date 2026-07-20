@@ -16,3 +16,10 @@ if (fs.existsSync(seedsSrc)) {
   fs.cpSync(seedsSrc, seedsDest, { recursive: true });
   console.log(`[copyAgentSystemAssets] Copied "${seedsSrc}" -> "${seedsDest}"`);
 }
+
+const publicSrc = path.join(projectRoot, "public");
+const publicDest = path.join(projectRoot, "dist", "public");
+if (fs.existsSync(publicSrc)) {
+  fs.cpSync(publicSrc, publicDest, { recursive: true });
+  console.log(`[copyAgentSystemAssets] Copied "${publicSrc}" -> "${publicDest}"`);
+}

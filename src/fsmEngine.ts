@@ -194,9 +194,10 @@ const OPTIMIZABLE_STATUSES: ReadonlySet<TaskStatus> = new Set([
   "VERIFYING",
 ]);
 
-/** After a successful SUPERVISOR optimization, escalate from GOOGLE to ANTHROPIC for quality. */
+/** After a successful SUPERVISOR optimization, escalate from GOOGLE to ANTHROPIC when configured. */
 function providerSwitchAfterOptimization(state: TaskState): Partial<TaskState> {
-  if (state.preferredProvider === "GOOGLE") {
+  const anthropicKey = process.env.ANTHROPIC_API_KEY?.trim() ?? "";
+  if (state.preferredProvider === "GOOGLE" && anthropicKey.length > 20) {
     console.log(
       `[fsmEngine] Switching LLM provider GOOGLE → ANTHROPIC after optimization for task "${state.taskId}".`
     );
@@ -312,6 +313,20 @@ const TRANSITION_TABLE: readonly Transition[] = [
     to: "ESCALATED",
     guard: (state, signal) =>
       signal.kind === "DELIVERABLE_REJECTED" && state.status !== "ESCALATED" && state.status !== "DONE",
+  },
+
+  // --- CODER deliverable retry (orchestrator rejects incomplete blueprint step) ---
+  {
+    from: "*",
+    to: "EXECUTING",
+    guard: (state, signal) =>
+      signal.kind === "BLUEPRINT_STEP_RETRY" && !isTerminalStatus(state.status),
+    apply: (state, signal) => ({
+      previousStatus: null,
+      ...(signal.kind === "BLUEPRINT_STEP_RETRY" && signal.stepIndex !== undefined
+        ? { blueprintStepIndex: signal.stepIndex }
+        : {}),
+    }),
   },
 
   // --- BLUEPRINT mid-execution ---
@@ -776,7 +791,7 @@ export class StateMachine {
     role: AgentRole,
     sandboxRoot: string,
     priorSteps: readonly StepResult[] = [],
-    options: RunAgentOptions = {}
+    options: RunAgentOptions & { readonly skipDispatch?: boolean } = {}
   ): Promise<{ readonly state: TaskState; readonly stepResult: StepResult }> {
     const state = await this.getTaskState(taskId);
     const stepIndex = nextStepIndex(state);
@@ -823,6 +838,10 @@ export class StateMachine {
         state.costScopeId,
         `Fiscal budget breached: $${budget.spentUsd.toFixed(4)} of $${budget.limitUsd.toFixed(2)}.`
       );
+    }
+
+    if (options.skipDispatch) {
+      return { state: await this.getTaskState(taskId), stepResult: result };
     }
 
     const nextState = await this.dispatch(taskId, { kind: "STEP_RESULT", stepId: result.stepId, result });

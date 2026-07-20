@@ -31,6 +31,9 @@ it.
    can't make progress, clearly state what you tried, what failed, and what
    you think the blocker is, rather than repeating the same failing approach
    again unchanged.
+8. **Tool budget on implementation steps.** You have limited tool steps per turn.
+   After at most **3** `search_files` / `read_file_slice` calls, you **must**
+   call `write_file` — do not keep exploring directories or re-reading the same file.
 
 ## Project context
 

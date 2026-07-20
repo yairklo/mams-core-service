@@ -316,7 +316,7 @@ export type TaskSignal =
   | { readonly kind: "ARCHITECTURE_REQUIRED" }
   | { readonly kind: "ARCHITECTURE_ARTIFACTS_READY"; readonly totalSteps: number }
   | { readonly kind: "BLUEPRINT_STEP_ADVANCED"; readonly stepIndex: number; readonly totalSteps: number }
-  | { readonly kind: "BLUEPRINT_STEP_RETRY" }
+  | { readonly kind: "BLUEPRINT_STEP_RETRY"; readonly stepIndex?: number }
   | { readonly kind: "TASK_CANCELLED"; readonly by: string; readonly reason?: string }
   | { readonly kind: "TASK_ABORTED"; readonly by: string; readonly reason?: string }
   | { readonly kind: "TOOL_CIRCUIT_OPEN"; readonly toolName: string; readonly argsHash: string }

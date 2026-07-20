@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MAMS Control Center</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            gray: {
+              850: '#1e2530',
+              950: '#0b0f17',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <!-- React & ReactDOM -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <!-- Babel Standalone for browser compilation of JSX -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0b0f17;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #1e293b;
+      border-radius: 3px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #334155;
+    }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen font-sans antialiased">
+  <div id="root"></div>
+
+  <!-- Load Babel JSX Scripts -->
+  <script src="icons.js" type="text/babel"></script>
+  <script src="create-modal.js" type="text/babel"></script>
+  <script src="metric-cards.js" type="text/babel"></script>
+  <script src="metadata-sidebar.js" type="text/babel"></script>
+  <script src="hitl-console.js" type="text/babel"></script>
+  <script src="timeline.js" type="text/babel"></script>
+  <script src="app.js" type="text/babel"></script>
+</body>
+</html>

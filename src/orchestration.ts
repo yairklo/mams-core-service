@@ -306,7 +306,7 @@ async function validateCoderDeliverableWithRetry(
     console.warn(
       `[orchestrator] CODER deliverable incomplete for "${taskId}" (attempt ${nextFailures}/${MAX_CODER_DELIVERABLE_ATTEMPTS} on blueprint step ${executedBlueprintStepIndex + 1}): ${validation.reason}`
     );
-    await sm.dispatch(taskId, { kind: "BLUEPRINT_STEP_RETRY" });
+    await sm.dispatch(taskId, { kind: "BLUEPRINT_STEP_RETRY", stepIndex: executedBlueprintStepIndex });
     return { kind: "retry", failures: nextFailures };
   }
 
@@ -347,12 +347,26 @@ async function afterArchitectTurn(
   return maybeAutoApproveBlueprint(sm, taskId);
 }
 
+async function loadPriorStepsFromDb(taskId: TaskId): Promise<StepResult[]> {
+  const rows = await loadStepRecords(taskId);
+  return rows.map((row) => ({
+    stepId: row.stepId as StepResult["stepId"],
+    taskId,
+    agentId: row.agentId as StepResult["agentId"],
+    toolCalls: [],
+    producedArtifacts: [],
+    narrativeSummary: row.narrativeSummary,
+    usage: row.usage,
+    timestampMs: row.timestampMs,
+  }));
+}
+
 export async function runTaskOrchestration(
   sm: StateMachine,
   taskId: TaskId,
   sandboxRoot: string
 ): Promise<void> {
-  const priorSteps: StepResult[] = [];
+  const priorSteps: StepResult[] = await loadPriorStepsFromDb(taskId);
   const maxIterations = 250;
   const abortController = new AbortController();
   orchestrationAbortControllers.set(taskId, abortController);
@@ -474,17 +488,19 @@ async function runTaskOrchestrationInner(
       let stepResult: StepResult;
       let nextState: TaskState;
       try {
-        ({ state: nextState, stepResult } = await sm.executeAgentTurn(taskId, role, sandboxRoot, priorSteps));
+        ({ state: nextState, stepResult } = await sm.executeAgentTurn(taskId, role, sandboxRoot, priorSteps, {
+          skipDispatch: role === "CODER",
+        }));
       } finally {
         endAgentTurn(taskId);
       }
-      priorSteps.push(stepResult);
-      await persistCompletedStep(taskId, role, nextState.history.length - 1, stepResult);
       await cleanupWorkspaceScratchFiles(sandboxRoot).catch((err) => {
         console.warn(`[orchestrator] Scratch cleanup failed after step for "${taskId}":`, err);
       });
 
       if (role === "ARCHITECT" && previousStatus === "ARCHITECTING") {
+        priorSteps.push(stepResult);
+        await persistCompletedStep(taskId, role, nextState.history.length - 1, stepResult);
         const architectOutcome = await afterArchitectTurn(sm, taskId, sandboxRoot, stepResult, priorSteps);
         if (architectOutcome === "retry") {
           await refreshRuntimeSnapshot(taskId, state, priorSteps, sandboxRoot);
@@ -511,17 +527,29 @@ async function runTaskOrchestrationInner(
           continue;
         }
         if (coderOutcome.kind === "reject") {
+          priorSteps.push(stepResult);
+          await persistCompletedStep(taskId, role, (await sm.getTaskState(taskId)).history.length, stepResult);
           await refreshRuntimeSnapshot(taskId, coderOutcome.state, priorSteps, sandboxRoot);
           return;
         }
         coderDeliverableFailures = 0;
+        nextState = await sm.dispatch(taskId, {
+          kind: "STEP_RESULT",
+          stepId: stepResult.stepId,
+          result: stepResult,
+        });
       } else {
         const rejection = await validateRoleDeliverable(sm, taskId, role, stepResult, sandboxRoot);
         if (rejection) {
+          priorSteps.push(stepResult);
+          await persistCompletedStep(taskId, role, nextState.history.length - 1, stepResult);
           await refreshRuntimeSnapshot(taskId, rejection, priorSteps, sandboxRoot);
           return;
         }
       }
+
+      priorSteps.push(stepResult);
+      await persistCompletedStep(taskId, role, nextState.history.length - 1, stepResult);
 
       state = nextState;
       await refreshRuntimeSnapshot(taskId, state, priorSteps, sandboxRoot);

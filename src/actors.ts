@@ -450,7 +450,7 @@ export function resolveMaxToolRoundtripsForRole(role: AgentRole, executionTier?:
       return 4;
     case "CODER":
       if (executionTier === "TIER3_CRITICAL" || executionTier === "TIER4_ENTERPRISE_E2E") {
-        return 12;
+        return 16;
       }
       return DEFAULT_MAX_TOOL_ROUNDTRIPS;
     default:

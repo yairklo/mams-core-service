@@ -799,6 +799,11 @@ export function mountMamsRoutes(app: Express, deps: MamsRouterDeps = {}): void {
     next();
   });
   app.use(express.json({ limit: "1mb" }));
+  const projectRoot = join(process.cwd());
+  app.use("/dashboard", express.static(join(projectRoot, "public", "dashboard")));
+  app.get("/admin", (req, res) => {
+    res.redirect("/dashboard");
+  });
   app.use("/api/mams", createMamsRouter(deps));
 }
 
