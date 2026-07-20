@@ -5,15 +5,21 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { TaskId } from "./types.js";
 import { buildGitMetadata } from "./gitMetadata.js";
 import {
   buildFallbackBranchName,
+  buildShallowWorkspaceTree,
   collectWorkspaceChanges,
   hasMeaningfulSourceChanges,
+  isExcludedFromWorkspaceContext,
+  isWorkspaceScratchPath,
+  listFilteredRepoPaths,
+  normalizeRepoPath,
+  parseUntrackedPathsFromPorcelain,
   resetLockfileDrift,
   type GitProcessRunner,
 } from "./workspaceGit.js";
@@ -282,6 +288,11 @@ export function createWriteFileTool(sandboxRoot: string) {
     description: "Writes a file within the task sandbox. Overwrites if exists.",
     inputSchema: WriteFileInputSchema,
     execute: async ({ path, content }): Promise<WriteFileOutput> => {
+      if (isWorkspaceScratchPath(path)) {
+        throw new Error(
+          `Refusing to write scratch/probe file "${path}" (script*.js, tmp_*). Edit product source files under server/, mobile_app/, etc.`
+        );
+      }
       const absolutePath = resolveSandboxPath(sandboxRoot, path);
       await mkdir(dirname(absolutePath), { recursive: true });
       await writeFile(absolutePath, content, "utf8");
@@ -299,9 +310,52 @@ const ReadFileInputSchema = z.object({
   path: z.string().min(1),
 });
 
-/** Keep tool payloads small — each read is re-sent on every subsequent LLM step. */
-export const MAX_READ_FILE_CHARS = 48_000;
+/** Max tool response body returned to the LLM (search_files, read_file_slice). */
+export const MAX_TOOL_RESPONSE_BYTES = 4 * 1024;
+const TOOL_RESPONSE_TRUNCATION_WARNING =
+  "\n[MAMS SYSTEM WARNING: Tool output truncated to 4KB — refine query, pathPrefix, startLine, or lineCount.]";
+
+export function capToolResponseText(
+  text: string,
+  maxBytes: number = MAX_TOOL_RESPONSE_BYTES
+): { readonly text: string; readonly truncated: boolean } {
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes <= maxBytes) {
+    return { text, truncated: false };
+  }
+  const tail = Buffer.from(text, "utf8").subarray(0, Math.max(0, maxBytes - Buffer.byteLength(TOOL_RESPONSE_TRUNCATION_WARNING, "utf8")));
+  return { text: `${TOOL_RESPONSE_TRUNCATION_WARNING}${tail.toString("utf8")}`, truncated: true };
+}
+
+/** Max lines returned by read_file_slice (token budget). */
+export const MAX_READ_FILE_SLICE_LINES = 80;
+export const MAX_READ_FILE_SLICE_CHARS = MAX_TOOL_RESPONSE_BYTES;
+/** Max matches returned by search_files per call. */
+export const MAX_SEARCH_FILE_MATCHES = 25;
+/** Keep full read_file payloads bounded — prefer read_file_slice / search_files first. */
+export const MAX_READ_FILE_CHARS = 24_000;
 export const MAX_ARCHITECT_READ_FILE_CHARS = 12_000;
+const MAX_SEARCH_FILE_BYTES = 512 * 1024;
+const SEARCHABLE_EXTENSIONS = /\.(js|jsx|ts|tsx|mjs|cjs|json|md|prisma|css|scss|yaml|yml)$/i;
+
+const readFileTurnCache = new Map<string, ReadFileOutput>();
+
+export function clearReadFileTurnCache(sandboxRoot?: string): void {
+  if (sandboxRoot === undefined) {
+    readFileTurnCache.clear();
+    return;
+  }
+  const prefix = `${assertSandboxRootIsContained(sandboxRoot)}:`;
+  for (const key of readFileTurnCache.keys()) {
+    if (key.startsWith(prefix)) {
+      readFileTurnCache.delete(key);
+    }
+  }
+}
+
+function readFileCacheKey(sandboxRoot: string, relativePath: string): string {
+  return `${assertSandboxRootIsContained(sandboxRoot)}:${relativePath.replace(/\\/g, "/")}`;
+}
 
 /** Raw implementation sources are never readable by ARCHITECT (context bloat). */
 const ARCHITECT_BLOCKED_READ_EXTENSIONS = /\.(ts|tsx|js|jsx|mjs|cjs|py)$/i;
@@ -335,14 +389,11 @@ export interface ReadFileOutput {
 }
 
 function isBlockedReadPath(relativePath: string): string | null {
-  const normalized = relativePath.replace(/\\/g, "/").replace(/^\.\/+/, "").toLowerCase();
-  if (
-    normalized.startsWith("node_modules/") ||
-    normalized.includes("/node_modules/") ||
-    normalized.startsWith(".git/") ||
-    normalized.includes("/.git/")
-  ) {
-    return "Refusing to read dependency or VCS internals (node_modules/, .git/). Target source files instead.";
+  if (isExcludedFromWorkspaceContext(relativePath)) {
+    if (isWorkspaceScratchPath(relativePath)) {
+      return "Refusing to read scratch/probe files (script*.js, tmp_*). Use search_files on product source paths instead.";
+    }
+    return "Refusing to read heavy build/cache paths, binaries (.png/.jpg/.pck), or dependency folders. Use search_files + read_file_slice on source paths.";
   }
   return null;
 }
@@ -381,6 +432,11 @@ export function createReadFileTool(sandboxRoot: string, options: { readonly arch
       if (blockedReason) {
         return { path, content: blockedReason, truncated: false, totalChars: blockedReason.length };
       }
+      const cacheKey = readFileCacheKey(sandboxRoot, path);
+      const cached = readFileTurnCache.get(cacheKey);
+      if (cached) {
+        return cached;
+      }
       const absolutePath = resolveSandboxPath(sandboxRoot, path);
       const raw = await readFile(absolutePath, "utf8");
       const totalChars = raw.length;
@@ -389,51 +445,362 @@ export function createReadFileTool(sandboxRoot: string, options: { readonly arch
           ? raw
           : raw.slice(0, maxChars) +
             `\n\n[TRUNCATED: showing first ${maxChars} of ${totalChars} characters.]`;
-      return {
+      const output: ReadFileOutput = {
         path,
         content,
         ...(totalChars > maxChars ? { truncated: true, totalChars } : { totalChars }),
       };
+      readFileTurnCache.set(cacheKey, output);
+      return output;
     },
   });
+}
+
+/** Project metadata paths verification agents may read without a workspace diff. */
+const VERIFIER_METADATA_READ_ALLOWLIST: readonly RegExp[] = ARCHITECT_READ_ALLOWLIST;
+
+function normalizeRelativeRepoPath(relativePath: string): string {
+  return normalizeRepoPath(relativePath);
+}
+
+function isVerifierMetadataReadPath(relativePath: string): boolean {
+  const normalized = normalizeRelativeRepoPath(relativePath);
+  return VERIFIER_METADATA_READ_ALLOWLIST.some((pattern) => pattern.test(normalized));
+}
+
+function isPathInChangedSet(relativePath: string, changedPaths: readonly string[]): boolean {
+  const normalized = normalizeRelativeRepoPath(relativePath);
+  return changedPaths.some((changed) => normalizeRelativeRepoPath(changed) === normalized);
+}
+
+async function readSandboxTextFile(
+  sandboxRoot: string,
+  path: string,
+  maxChars: number
+): Promise<ReadFileOutput> {
+  const absolutePath = resolveSandboxPath(sandboxRoot, path);
+  const raw = await readFile(absolutePath, "utf8");
+  const totalChars = raw.length;
+  const content =
+    totalChars <= maxChars
+      ? raw
+      : raw.slice(0, maxChars) + `\n\n[TRUNCATED: showing first ${maxChars} of ${totalChars} characters.]`;
+  return {
+    path,
+    content,
+    ...(totalChars > maxChars ? { truncated: true, totalChars } : { totalChars }),
+  };
+}
+
+/** Restricted read_file for TESTER/QA/SPEC_REVIEWER — metadata or changed workspace files only. */
+export function createVerifierReadFileTool(sandboxRoot: string) {
+  assertSandboxRootIsContained(sandboxRoot);
+  return tool({
+    description:
+      "Reads UTF-8 files for verification: project metadata (package.json, schema.prisma, tsconfig) or files changed in this workspace.",
+    inputSchema: ReadFileInputSchema,
+    execute: async ({ path }): Promise<ReadFileOutput> => {
+      const blockedReason = isBlockedReadPath(path);
+      if (blockedReason) {
+        return { path, content: blockedReason, truncated: false, totalChars: blockedReason.length };
+      }
+      const realRoot = assertSandboxRootIsContained(sandboxRoot);
+      const changes = await collectWorkspaceChanges(createSandboxGitRunner(realRoot));
+      const changedPaths = [...new Set([...changes.allPaths, ...changes.meaningfulPaths])];
+      if (!isVerifierMetadataReadPath(path) && !isPathInChangedSet(path, changedPaths)) {
+        throw new Error(
+          `Refusing verifier read of "${path}". Allowed: metadata files (package.json, schema.prisma, tsconfig, .mams-rules.md) or paths returned by list_changed_files.`
+        );
+      }
+      return readSandboxTextFile(realRoot, path, MAX_READ_FILE_CHARS);
+    },
+  });
+}
+
+const ReadFileSliceInputSchema = z.object({
+  path: z.string().min(1),
+  startLine: z.number().int().min(1).default(1),
+  lineCount: z.number().int().min(1).max(MAX_READ_FILE_SLICE_LINES).default(80),
+});
+
+export interface ReadFileSliceOutput {
+  readonly path: string;
+  readonly startLine: number;
+  readonly endLine: number;
+  readonly totalLines: number;
+  readonly content: string;
+  readonly truncated?: boolean;
+}
+
+async function readSandboxTextSlice(
+  sandboxRoot: string,
+  path: string,
+  startLine: number,
+  lineCount: number
+): Promise<ReadFileSliceOutput> {
+  const absolutePath = resolveSandboxPath(sandboxRoot, path);
+  const raw = await readFile(absolutePath, "utf8");
+  const lines = raw.split("\n");
+  const totalLines = lines.length;
+  const safeStart = Math.min(Math.max(startLine, 1), totalLines === 0 ? 1 : totalLines);
+  const safeCount = Math.min(lineCount, MAX_READ_FILE_SLICE_LINES);
+  const endLine = Math.min(safeStart + safeCount - 1, totalLines);
+  const selected = lines.slice(safeStart - 1, endLine);
+  let content = selected
+    .map((line, index) => `${String(safeStart + index).padStart(6, " ")}| ${line}`)
+    .join("\n");
+  let truncated = false;
+  const capped = capToolResponseText(content, MAX_TOOL_RESPONSE_BYTES);
+  content = capped.text;
+  truncated = capped.truncated;
+  return { path, startLine: safeStart, endLine, totalLines, content, ...(truncated ? { truncated } : {}) };
+}
+
+async function assertVerifierMayAccessPath(
+  sandboxRoot: string,
+  path: string
+): Promise<void> {
+  const realRoot = assertSandboxRootIsContained(sandboxRoot);
+  const changes = await collectWorkspaceChanges(createSandboxGitRunner(realRoot));
+  const changedPaths = [...new Set([...changes.allPaths, ...changes.meaningfulPaths])];
+  if (!isVerifierMetadataReadPath(path) && !isPathInChangedSet(path, changedPaths)) {
+    throw new Error(
+      `Refusing verifier access to "${path}". Allowed: metadata files or paths from list_changed_files.`
+    );
+  }
+}
+
+export function createReadFileSliceTool(
+  sandboxRoot: string,
+  options: { readonly architectMode?: boolean; readonly verifierMode?: boolean } = {}
+) {
+  assertSandboxRootIsContained(sandboxRoot);
+  return tool({
+    description: `Reads a line range from a UTF-8 file (max ${MAX_READ_FILE_SLICE_LINES} lines). Prefer this over read_file for large sources.`,
+    inputSchema: ReadFileSliceInputSchema,
+    execute: async ({ path, startLine, lineCount }): Promise<ReadFileSliceOutput> => {
+      if (options.architectMode && !isArchitectReadPathAllowed(path)) {
+        throw new Error(`Refusing ARCHITECT slice read of "${path}".`);
+      }
+      const blockedReason = isBlockedReadPath(path);
+      if (blockedReason) {
+        return {
+          path,
+          startLine: 1,
+          endLine: 1,
+          totalLines: 0,
+          content: blockedReason,
+        };
+      }
+      if (options.verifierMode) {
+        await assertVerifierMayAccessPath(sandboxRoot, path);
+      }
+      return readSandboxTextSlice(assertSandboxRootIsContained(sandboxRoot), path, startLine, lineCount);
+    },
+  });
+}
+
+const SearchFilesInputSchema = z.object({
+  query: z.string().min(1),
+  pathPrefix: z.string().default("."),
+  maxMatches: z.number().int().min(1).max(MAX_SEARCH_FILE_MATCHES).default(20),
+  caseSensitive: z.boolean().default(false),
+});
+
+export interface SearchFilesMatch {
+  readonly path: string;
+  readonly line: number;
+  readonly text: string;
+}
+
+export interface SearchFilesOutput {
+  readonly query: string;
+  readonly pathPrefix: string;
+  readonly matches: readonly SearchFilesMatch[];
+  readonly truncated: boolean;
+  readonly filesScanned: number;
+}
+
+async function listSearchableRepoFiles(sandboxRoot: string, pathPrefix: string): Promise<string[]> {
+  const realRoot = assertSandboxRootIsContained(sandboxRoot);
+  const files = await listFilteredRepoPaths(createSandboxGitRunner(realRoot), pathPrefix);
+  return files.filter((line) => SEARCHABLE_EXTENSIONS.test(line));
+}
+
+async function searchWorkspaceFiles(
+  sandboxRoot: string,
+  query: string,
+  options: {
+    readonly pathPrefix: string;
+    readonly maxMatches: number;
+    readonly caseSensitive: boolean;
+    readonly allowedPaths?: ReadonlySet<string>;
+  }
+): Promise<SearchFilesOutput> {
+  const realRoot = assertSandboxRootIsContained(sandboxRoot);
+  const needle = options.caseSensitive ? query : query.toLowerCase();
+  const files = await listSearchableRepoFiles(realRoot, options.pathPrefix);
+  const scopedFiles =
+    options.allowedPaths === undefined
+      ? files
+      : files.filter((file) => options.allowedPaths!.has(normalizeRelativeRepoPath(file)));
+  const matches: SearchFilesMatch[] = [];
+  let filesScanned = 0;
+
+  for (const relPath of scopedFiles) {
+    if (matches.length >= options.maxMatches) {
+      break;
+    }
+    filesScanned += 1;
+    let absolutePath: string;
+    try {
+      absolutePath = resolveSandboxPath(realRoot, relPath);
+    } catch {
+      continue;
+    }
+    let raw: string;
+    try {
+      const stat = await readFile(absolutePath, "utf8");
+      if (Buffer.byteLength(stat, "utf8") > MAX_SEARCH_FILE_BYTES) {
+        continue;
+      }
+      raw = stat;
+    } catch {
+      continue;
+    }
+    const lines = raw.split("\n");
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      if (matches.length >= options.maxMatches) {
+        break;
+      }
+      const line = lines[lineIndex] ?? "";
+      const haystack = options.caseSensitive ? line : line.toLowerCase();
+      if (!haystack.includes(needle)) {
+        continue;
+      }
+      matches.push({
+        path: relPath,
+        line: lineIndex + 1,
+        text: line.trim().slice(0, 120),
+      });
+    }
+  }
+
+  let truncated = matches.length >= options.maxMatches;
+  let responseBody = JSON.stringify({ query, pathPrefix: options.pathPrefix, matches, filesScanned });
+  if (Buffer.byteLength(responseBody, "utf8") > MAX_TOOL_RESPONSE_BYTES) {
+    const cappedMatches: SearchFilesMatch[] = [];
+    for (const match of matches) {
+      cappedMatches.push(match);
+      responseBody = JSON.stringify({
+        query,
+        pathPrefix: options.pathPrefix,
+        matches: cappedMatches,
+        filesScanned,
+      });
+      if (Buffer.byteLength(responseBody, "utf8") > MAX_TOOL_RESPONSE_BYTES - 256) {
+        cappedMatches.pop();
+        truncated = true;
+        break;
+      }
+    }
+    return {
+      query,
+      pathPrefix: options.pathPrefix,
+      matches: cappedMatches,
+      truncated: true,
+      filesScanned,
+    };
+  }
+
+  return {
+    query,
+    pathPrefix: options.pathPrefix,
+    matches,
+    truncated,
+    filesScanned,
+  };
+}
+
+export function createSearchFilesTool(
+  sandboxRoot: string,
+  options: { readonly verifierMode?: boolean } = {}
+) {
+  assertSandboxRootIsContained(sandboxRoot);
+  return tool({
+    description:
+      "Searches tracked workspace files for a literal string and returns path:line snippets (token-efficient). Use before read_file_slice.",
+    inputSchema: SearchFilesInputSchema,
+    execute: async ({ query, pathPrefix, maxMatches, caseSensitive }): Promise<SearchFilesOutput> => {
+      const realRoot = assertSandboxRootIsContained(sandboxRoot);
+      let allowedPaths: ReadonlySet<string> | undefined;
+      if (options.verifierMode) {
+        const changes = await collectWorkspaceChanges(createSandboxGitRunner(realRoot));
+        allowedPaths = new Set(
+          [...changes.allPaths, ...changes.meaningfulPaths].map((path) => normalizeRelativeRepoPath(path))
+        );
+      }
+      return searchWorkspaceFiles(realRoot, query, {
+        pathPrefix,
+        maxMatches: Math.min(maxMatches, MAX_SEARCH_FILE_MATCHES),
+        caseSensitive,
+        ...(allowedPaths ? { allowedPaths } : {}),
+      });
+    },
+  });
+}
+
+/** Deletes untracked scratch/probe files (script*.js, tmp_*) from the sandbox disk. */
+export async function cleanupWorkspaceScratchFiles(
+  sandboxRoot: string
+): Promise<{ readonly deletedPaths: readonly string[] }> {
+  const realRoot = assertSandboxRootIsContained(sandboxRoot);
+  const gitDir = join(realRoot, ".git");
+  if (!existsSync(gitDir)) {
+    return { deletedPaths: [] };
+  }
+
+  const runner = createSandboxGitRunner(realRoot);
+  const status = await runner.run(["status", "--porcelain"], "git_status_scratch_cleanup");
+  if (status.exitCode !== 0) {
+    return { deletedPaths: [] };
+  }
+
+  const deletedPaths: string[] = [];
+  for (const relPath of parseUntrackedPathsFromPorcelain(status.stdout)) {
+    if (!isWorkspaceScratchPath(relPath)) {
+      continue;
+    }
+    try {
+      await unlink(resolveSandboxPath(realRoot, relPath));
+      deletedPaths.push(relPath);
+    } catch {
+      // Best-effort cleanup — ignore busy or already-deleted files.
+    }
+  }
+
+  if (deletedPaths.length > 0) {
+    console.log(`[workspace] Removed ${deletedPaths.length} scratch file(s): ${deletedPaths.join(", ")}`);
+  }
+
+  return { deletedPaths };
 }
 
 export function createListRepoStructureTool(sandboxRoot: string) {
   assertSandboxRootIsContained(sandboxRoot);
   return tool({
     description:
-      "Lists repository layout (top-level dirs + second level) via git ls-files — use before targeted read_file.",
+      "Lists a shallow workspace directory tree (depth 1–3; excludes .next, dist, node_modules, binaries).",
     inputSchema: z.object({}).default({}),
     execute: async (): Promise<{ readonly tree: string; readonly fileCount: number }> => {
       const realRoot = assertSandboxRootIsContained(sandboxRoot);
-      const runner = createSandboxGitRunner(realRoot);
-      const result = await runner.run(
-        ["ls-files", "--cached", "--others", "--exclude-standard"],
-        "git_ls_files_structure"
-      );
-      const lines = result.stdout
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0 && !line.includes("node_modules/"));
-      const topLevel = new Set<string>();
-      const secondLevel = new Set<string>();
-      for (const line of lines.slice(0, 800)) {
-        const parts = line.split("/");
-        if (parts[0]) {
-          topLevel.add(parts[0]);
-        }
-        if (parts.length >= 2) {
-          secondLevel.add(`${parts[0]}/${parts[1]}`);
-        }
-      }
-      const tree = [
-        "## Top-level",
-        ...[...topLevel].sort(),
-        "",
-        "## Second level (sample)",
-        ...[...secondLevel].sort().slice(0, 60),
-      ].join("\n");
-      return { tree, fileCount: lines.length };
+      const paths = await listFilteredRepoPaths(createSandboxGitRunner(realRoot));
+      const layout = buildShallowWorkspaceTree(paths);
+      const capped = capToolResponseText(layout.tree, MAX_TOOL_RESPONSE_BYTES);
+      return {
+        tree: capped.text,
+        fileCount: layout.fileCount,
+      };
     },
   });
 }
@@ -470,7 +837,19 @@ export interface RunLocalTestsOutput {
   readonly durationMs: number;
 }
 
-const MAX_CAPTURED_OUTPUT_BYTES = 512 * 1024;
+const MAX_CAPTURED_OUTPUT_BYTES = 32 * 1024;
+const OUTPUT_TRUNCATION_WARNING =
+  "\n[MAMS SYSTEM WARNING: Output truncated to protect context window limit]...";
+
+function truncateCapturedProcessOutput(text: string): string {
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes <= MAX_CAPTURED_OUTPUT_BYTES) {
+    return text;
+  }
+  const buf = Buffer.from(text, "utf8");
+  const tail = buf.subarray(Math.max(0, buf.length - MAX_CAPTURED_OUTPUT_BYTES)).toString("utf8");
+  return `${OUTPUT_TRUNCATION_WARNING}${tail}`;
+}
 
 function buildDockerInvocation(
   absoluteSandboxRoot: string,
@@ -564,15 +943,23 @@ function runProcess(
       let stderr = "";
       let timedOut = false;
       let settled = false;
+      let stdoutRawBytes = 0;
+      let stderrRawBytes = 0;
 
-      const appendBounded = (buf: string, chunk: Buffer): string =>
-        buf.length >= MAX_CAPTURED_OUTPUT_BYTES ? buf : buf + chunk.toString("utf8");
+      const appendChunk = (buf: string, chunk: Buffer): { readonly text: string; readonly rawBytes: number } => {
+        const nextRawBytes = Buffer.byteLength(buf, "utf8") + chunk.length;
+        return { text: buf + chunk.toString("utf8"), rawBytes: nextRawBytes };
+      };
 
       child.stdout?.on("data", (chunk: Buffer) => {
-        stdout = appendBounded(stdout, chunk);
+        const next = appendChunk(stdout, chunk);
+        stdout = next.text;
+        stdoutRawBytes = next.rawBytes;
       });
       child.stderr?.on("data", (chunk: Buffer) => {
-        stderr = appendBounded(stderr, chunk);
+        const next = appendChunk(stderr, chunk);
+        stderr = next.text;
+        stderrRawBytes = next.rawBytes;
       });
 
       const timer = setTimeout(() => {
@@ -590,9 +977,12 @@ function runProcess(
       child.on("error", (err) => {
         settle({
           exitCode: null,
-          stdout: sanitizeSensitiveOutput(stdout),
+          stdout: sanitizeSensitiveOutput(
+            stdoutRawBytes > MAX_CAPTURED_OUTPUT_BYTES ? truncateCapturedProcessOutput(stdout) : stdout
+          ),
           stderr: sanitizeSensitiveOutput(
-            stderr + `\n[run_process] Failed to spawn "${command}": ${String(err)}`
+            (stderrRawBytes > MAX_CAPTURED_OUTPUT_BYTES ? truncateCapturedProcessOutput(stderr) : stderr) +
+              `\n[run_process] Failed to spawn "${command}": ${String(err)}`
           ),
           timedOut: false,
           durationMs: Date.now() - startedAt,
@@ -602,8 +992,12 @@ function runProcess(
       child.on("close", (code) => {
         settle({
           exitCode: code,
-          stdout: sanitizeSensitiveOutput(stdout),
-          stderr: sanitizeSensitiveOutput(stderr),
+          stdout: sanitizeSensitiveOutput(
+            stdoutRawBytes > MAX_CAPTURED_OUTPUT_BYTES ? truncateCapturedProcessOutput(stdout) : stdout
+          ),
+          stderr: sanitizeSensitiveOutput(
+            stderrRawBytes > MAX_CAPTURED_OUTPUT_BYTES ? truncateCapturedProcessOutput(stderr) : stderr
+          ),
           timedOut,
           durationMs: Date.now() - startedAt,
         });
@@ -736,6 +1130,8 @@ export function createSandboxGitRunner(cwd: string): GitProcessRunner {
 export interface ToolSet {
   readonly write_file: ReturnType<typeof createWriteFileTool>;
   readonly read_file: ReturnType<typeof createReadFileTool>;
+  readonly read_file_slice: ReturnType<typeof createReadFileSliceTool>;
+  readonly search_files: ReturnType<typeof createSearchFilesTool>;
   readonly list_changed_files: ReturnType<typeof createListChangedFilesTool>;
   readonly run_local_tests: ReturnType<typeof createRunLocalTestsTool>;
   readonly execute_claude_code_escalation: ReturnType<typeof createClaudeCodeEscalationTool>;
@@ -745,6 +1141,8 @@ export function createToolSet(sandboxRoot: string): ToolSet {
   return {
     write_file: createWriteFileTool(sandboxRoot),
     read_file: createReadFileTool(sandboxRoot),
+    read_file_slice: createReadFileSliceTool(sandboxRoot),
+    search_files: createSearchFilesTool(sandboxRoot),
     list_changed_files: createListChangedFilesTool(sandboxRoot),
     run_local_tests: createRunLocalTestsTool(sandboxRoot),
     execute_claude_code_escalation: createClaudeCodeEscalationTool(sandboxRoot),

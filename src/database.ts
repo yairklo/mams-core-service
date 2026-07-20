@@ -4,7 +4,9 @@
  */
 
 import { Prisma, PrismaClient } from "@prisma/client";
-import { parseTaskState, type TaskId, type TaskState } from "./types.js";
+import type { AgentRole } from "./actors.js";
+import { toPersistedStepView, type PersistedStepView } from "./taskObservability.js";
+import { parseTaskState, type StepResult, type TaskId, type TaskState } from "./types.js";
 
 const prisma = new PrismaClient();
 
@@ -122,6 +124,34 @@ export async function deleteTaskState(taskId: TaskId): Promise<void> {
   await prisma.agentTaskState.deleteMany({ where: { taskId } });
 }
 
+export async function loadAllTaskStates(): Promise<TaskState[]> {
+  const rows = await prisma.agentTaskState.findMany({
+    orderBy: { createdAt: "desc" },
+  });
+  const states: TaskState[] = [];
+  for (const row of rows) {
+    try {
+      const parsed = parseTaskState(row.state);
+      if (parsed.ok) {
+        states.push(parsed.state);
+      }
+    } catch {
+      // Skip corrupted
+    }
+  }
+  return states;
+}
+
+export async function loadAllStepUsages(): Promise<{ taskId: string; usage: any }[]> {
+  const rows = await prisma.agentStepRecord.findMany({
+    select: {
+      taskId: true,
+      usage: true,
+    },
+  });
+  return rows;
+}
+
 export async function recordFiscalSpend(costScopeId: string, deltaUsd: number): Promise<number> {
   const row = await prisma.agentCostLedger.upsert({
     where: { costScopeId },
@@ -153,6 +183,72 @@ export async function appendExecutionLog(entry: ExecutionLogEntry): Promise<void
   } catch (err) {
     console.error(`[database] Failed to append execution log for task "${entry.taskId}":`, err);
   }
+}
+
+export async function saveStepRecord(
+  taskId: TaskId,
+  stepIndex: number,
+  role: AgentRole,
+  step: StepResult
+): Promise<PersistedStepView> {
+  const createdAt = new Date();
+  const view = toPersistedStepView(stepIndex, role, step, createdAt);
+  try {
+    await prisma.agentStepRecord.upsert({
+      where: { taskId_stepId: { taskId, stepId: step.stepId } },
+      create: {
+        taskId,
+        stepId: step.stepId,
+        stepIndex,
+        agentId: step.agentId,
+        role,
+        narrativeSummary: step.narrativeSummary,
+        toolCalls: step.toolCalls.map((call) => ({
+          toolName: call.request.toolName,
+          args: call.request.args,
+          ok: call.result.ok,
+          errorMessage: call.result.ok ? null : call.result.message,
+        })) as Prisma.InputJsonValue,
+        usage: JSON.parse(JSON.stringify(step.usage)) as Prisma.InputJsonValue,
+        timestampMs: BigInt(step.timestampMs),
+      },
+      update: {
+        stepIndex,
+        agentId: step.agentId,
+        role,
+        narrativeSummary: step.narrativeSummary,
+        toolCalls: step.toolCalls.map((call) => ({
+          toolName: call.request.toolName,
+          args: call.request.args,
+          ok: call.result.ok,
+          errorMessage: call.result.ok ? null : call.result.message,
+        })) as Prisma.InputJsonValue,
+        usage: JSON.parse(JSON.stringify(step.usage)) as Prisma.InputJsonValue,
+        timestampMs: BigInt(step.timestampMs),
+      },
+    });
+  } catch (err) {
+    console.error(`[database] Failed to persist step record for task "${taskId}":`, err);
+  }
+  return view;
+}
+
+export async function loadStepRecords(taskId: TaskId): Promise<readonly PersistedStepView[]> {
+  const rows = await prisma.agentStepRecord.findMany({
+    where: { taskId },
+    orderBy: { stepIndex: "asc" },
+  });
+  return rows.map((row) => ({
+    stepId: row.stepId,
+    stepIndex: row.stepIndex,
+    agentId: row.agentId,
+    role: row.role,
+    narrativeSummary: row.narrativeSummary,
+    toolCalls: row.toolCalls as unknown as PersistedStepView["toolCalls"],
+    usage: row.usage as unknown as StepResult["usage"],
+    timestampMs: Number(row.timestampMs),
+    createdAt: row.createdAt.toISOString(),
+  }));
 }
 
 export async function disconnectDatabase(): Promise<void> {

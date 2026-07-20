@@ -20,6 +20,8 @@ import { z } from "zod";
 
 import { StateMachine, type CreateTaskOptions } from "./fsmEngine.js";
 
+import { loadAllStepUsages, loadAllTaskStates, loadStepRecords } from "./database.js";
+
 import { getTaskRuntimeSnapshot, isOrchestrationRunning, runTaskOrchestration, terminateTaskOrchestration } from "./orchestration.js";
 
 import { AGENT_WORKSPACES_BASE_DIR, assertSandboxRootIsContained } from "./tools.js";
@@ -103,9 +105,8 @@ const CloudWebhookBodySchema = z.object({
 
 
 const ApprovalBodySchema = z.object({
-
   by: z.string().min(1).default("human"),
-
+  userGuidance: z.string().optional(),
 });
 
 
@@ -291,51 +292,41 @@ export function createMamsRouter(deps: MamsRouterDeps = {}): Router {
 
 
   router.post("/task/:taskId/resume", async (req: Request, res: Response) => {
-
     const taskId = parseTaskIdParam(req.params.taskId);
-
     if (!taskId) {
-
       res.status(400).json({ error: "Missing taskId" });
-
       return;
-
     }
+    const parsed = z.object({ userGuidance: z.string().optional() }).safeParse(req.body ?? {});
+    const userGuidance = parsed.success ? parsed.data.userGuidance : undefined;
 
     try {
-
-      const state = await sm.getTaskState(taskId);
-
+      let state = await sm.getTaskState(taskId);
       if (isTerminalStatus(state.status)) {
-
         res.status(409).json({ error: `Task is terminal (${state.status}).` });
-
         return;
-
+      }
+      if (isOrchestrationRunning(taskId)) {
+        res.status(409).json({ error: "Orchestration is already running for this task." });
+        return;
       }
 
-      if (isOrchestrationRunning(taskId)) {
-
-        res.status(409).json({ error: "Orchestration is already running for this task." });
-
-        return;
-
+      if (state.status === "ESCALATED") {
+        state = await sm.dispatch(taskId, {
+          kind: "APPROVAL_GRANTED",
+          by: "human",
+          ...(userGuidance ? { userGuidance } : {}),
+        });
       }
 
       res.status(202).json({ taskId, status: state.status, message: "Orchestration resumed." });
-
       void runTaskOrchestration(sm, taskId, sandboxPathForTask(taskId)).catch((err) => {
-
         console.error(`[router] resume orchestration failed for "${taskId}":`, err);
-
       });
-
-    } catch {
-
-      res.status(404).json({ error: "Task not found" });
-
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(404).json({ error: `Task not found: ${msg}` });
     }
-
   });
 
 
@@ -384,7 +375,11 @@ export function createMamsRouter(deps: MamsRouterDeps = {}): Router {
 
       }
 
-      const next = await sm.dispatch(taskId, { kind: "APPROVAL_GRANTED", by: parsed.data.by });
+      const next = await sm.dispatch(taskId, {
+        kind: "APPROVAL_GRANTED",
+        by: parsed.data.by,
+        ...(parsed.data.userGuidance ? { userGuidance: parsed.data.userGuidance } : {}),
+      });
 
       res.json({ taskId: next.taskId, status: next.status });
 
@@ -594,7 +589,83 @@ export function createMamsRouter(deps: MamsRouterDeps = {}): Router {
 
 
 
+  router.get("/tasks", async (req: Request, res: Response) => {
+    try {
+      const states = await loadAllTaskStates();
+      const usages = await loadAllStepUsages();
+
+      const usageMap = new Map<string, { inputTokens: number; outputTokens: number; estimatedCostUsd: number }>();
+      for (const row of usages) {
+        const usage = row.usage as any;
+        if (usage) {
+          const current = usageMap.get(row.taskId) ?? { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 };
+          current.inputTokens += Number(usage.inputTokens ?? 0);
+          current.outputTokens += Number(usage.outputTokens ?? 0);
+          current.estimatedCostUsd += Number(usage.estimatedCostUsd ?? 0);
+          usageMap.set(row.taskId, current);
+        }
+      }
+
+      const list = states.map((state) => {
+        const usage = usageMap.get(state.taskId) ?? { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 };
+        return {
+          taskId: state.taskId,
+          status: state.status,
+          executionTier: state.executionTier,
+          blueprintStepIndex: state.blueprintStepIndex,
+          blueprintTotalSteps: state.blueprintTotalSteps,
+          aggregatedTokenUsage: usage,
+          orchestrationRunning: isOrchestrationRunning(state.taskId),
+        };
+      });
+
+      res.json({ tasks: list });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ error: `Failed to load tasks: ${message}` });
+    }
+  });
+
   router.get("/task/:taskId", async (req: Request, res: Response) => {
+    const taskId = parseTaskIdParam(req.params.taskId);
+    if (!taskId) {
+      res.status(400).json({ error: "Missing taskId" });
+      return;
+    }
+    try {
+      const state = await sm.getTaskState(taskId);
+      const runtime = getTaskRuntimeSnapshot(taskId);
+      const steps = await loadStepRecords(taskId);
+      const recentTools = steps.flatMap((s) => s.toolCalls.map((tc) => tc.toolName)).slice(-10);
+      const liveProgress = {
+        percent: state.blueprintTotalSteps > 0 ? Math.round((state.blueprintStepIndex / state.blueprintTotalSteps) * 100) : 0,
+        currentStep: state.blueprintStepIndex,
+        totalSteps: state.blueprintTotalSteps,
+      };
+
+      res.json({
+        taskId: state.taskId,
+        status: state.status,
+        executionTier: state.executionTier,
+        history: state.history,
+        blueprintStepIndex: state.blueprintStepIndex,
+        blueprintTotalSteps: state.blueprintTotalSteps,
+        architectureAlignmentStatus: state.architectureAlignmentStatus,
+        awaitingApprovalKind: state.awaitingApprovalKind,
+        orchestrationRunning: isOrchestrationRunning(taskId),
+        steps,
+        runtime,
+        recentTools,
+        liveProgress,
+      });
+    } catch {
+      res.status(404).json({ error: "Task not found" });
+    }
+  });
+
+
+
+  router.get("/task/:taskId/steps", async (req: Request, res: Response) => {
 
     const taskId = parseTaskIdParam(req.params.taskId);
 
@@ -608,31 +679,11 @@ export function createMamsRouter(deps: MamsRouterDeps = {}): Router {
 
     try {
 
-      const state = await sm.getTaskState(taskId);
+      await sm.getTaskState(taskId);
 
-      const runtime = getTaskRuntimeSnapshot(taskId);
+      const steps = await loadStepRecords(taskId);
 
-      res.json({
-
-        taskId: state.taskId,
-
-        status: state.status,
-
-        executionTier: state.executionTier,
-
-        history: state.history,
-
-        blueprintStepIndex: state.blueprintStepIndex,
-
-        blueprintTotalSteps: state.blueprintTotalSteps,
-
-        architectureAlignmentStatus: state.architectureAlignmentStatus,
-
-        awaitingApprovalKind: state.awaitingApprovalKind,
-
-        runtime,
-
-      });
+      res.json({ taskId, steps, orchestrationRunning: isOrchestrationRunning(taskId) });
 
     } catch {
 
@@ -737,11 +788,18 @@ export { runTaskOrchestration };
 
 
 export function mountMamsRoutes(app: Express, deps: MamsRouterDeps = {}): void {
-
+  app.use((req, res, next) => {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    if (req.method === "OPTIONS") {
+      res.sendStatus(200);
+      return;
+    }
+    next();
+  });
   app.use(express.json({ limit: "1mb" }));
-
   app.use("/api/mams", createMamsRouter(deps));
-
 }
 
 

@@ -14,6 +14,7 @@ import {
 import { appendExecutionLog, getFiscalSpend, loadTaskState, recordFiscalSpend, saveTaskState } from "./database.js";
 import { estimateTurnCostUsd } from "./pricing.js";
 import { readBlueprintSteps } from "./tools.js";
+import { MAX_CODER_PRIOR_STEPS } from "./contextTrimming.js";
 import {
   isTerminalStatus,
   nextStepIndex,
@@ -504,7 +505,20 @@ const TRANSITION_TABLE: readonly Transition[] = [
       signal.kind === "STEP_RESULT" && isStepResultSuccessful(signal.result) && state.previousStatus === "VERIFYING",
     apply: (state) => providerSwitchAfterOptimization(state),
   },
-  { from: "OPTIMIZING", to: "ESCALATED", guard: (_state, signal) => signal.kind === "STEP_RESULT" },
+  {
+    from: "OPTIMIZING",
+    to: "EXECUTING",
+    guard: (state, signal) =>
+      signal.kind === "STEP_RESULT" &&
+      isStepResultSuccessful(signal.result) &&
+      (state.previousStatus === null || state.previousStatus === "EXECUTING"),
+    apply: (state) => providerSwitchAfterOptimization(state),
+  },
+  {
+    from: "OPTIMIZING",
+    to: "ESCALATED",
+    guard: (_state, signal) => signal.kind === "STEP_RESULT" && !isStepResultSuccessful(signal.result),
+  },
 
   // --- AWAITING_APPROVAL (QA for TIER3/4) ---
   {
@@ -578,12 +592,31 @@ const TRANSITION_TABLE: readonly Transition[] = [
   // --- ESCALATED ---
   {
     from: "ESCALATED",
+    to: "EXECUTING",
+    guard: (state, signal) =>
+      signal.kind === "APPROVAL_GRANTED" && state.architectureAlignmentStatus === "approved",
+    apply: (state) => ({
+      retry: { ...state.retry, attempt: 0 },
+      optimization: { ...state.optimization, attempt: 0 },
+      previousStatus: null,
+      deadline: {
+        ...state.deadline,
+        absoluteMs: Math.max(state.deadline.absoluteMs, Date.now()) + 3_600_000,
+      },
+    }),
+  },
+  {
+    from: "ESCALATED",
     to: "PLANNING",
     guard: (state, signal) => signal.kind === "APPROVAL_GRANTED" && !tierSkipsPlanning(state.executionTier),
     apply: (state) => ({
       retry: { ...state.retry, attempt: 0 },
       optimization: { ...state.optimization, attempt: 0 },
       previousStatus: null,
+      deadline: {
+        ...state.deadline,
+        absoluteMs: Math.max(state.deadline.absoluteMs, Date.now()) + 3_600_000,
+      },
     }),
   },
   {
@@ -594,6 +627,10 @@ const TRANSITION_TABLE: readonly Transition[] = [
       retry: { ...state.retry, attempt: 0 },
       optimization: { ...state.optimization, attempt: 0 },
       previousStatus: null,
+      deadline: {
+        ...state.deadline,
+        absoluteMs: Math.max(state.deadline.absoluteMs, Date.now()) + 3_600_000,
+      },
     }),
   },
   { from: "ESCALATED", to: "FAILED", guard: (_state, signal) => signal.kind === "APPROVAL_DENIED" },
@@ -683,6 +720,17 @@ export function resolveAgentRoleForStatus(state: TaskState): AgentRole | null {
   }
 }
 
+/** Limits cross-turn narrative history for token-heavy roles (CODER). */
+export function trimPriorStepsForAgent(
+  role: AgentRole,
+  priorSteps: readonly StepResult[]
+): readonly StepResult[] {
+  if (role !== "CODER" || priorSteps.length <= MAX_CODER_PRIOR_STEPS) {
+    return priorSteps;
+  }
+  return priorSteps.slice(-MAX_CODER_PRIOR_STEPS);
+}
+
 export class StateMachine {
   private readonly fuseGuard: FuseGuard;
   private readonly fiscalBudgetLedger: FiscalBudgetLedger;
@@ -740,7 +788,7 @@ export class StateMachine {
 
     const context: AgentTaskContext = {
       contract: state.contract,
-      priorSteps,
+      priorSteps: trimPriorStepsForAgent(role, priorSteps),
       sandboxRoot,
       pmContext: state.pmContext,
       ...(state.blueprintTotalSteps > 0 ? { blueprintStepIndex: state.blueprintStepIndex } : {}),
@@ -828,7 +876,10 @@ export class StateMachine {
       return current;
     }
 
-    const forcedSignal = await this.checkHardStops(current);
+    const bypassHardStops =
+      current.status === "ESCALATED" &&
+      (signal.kind === "APPROVAL_GRANTED" || signal.kind === "APPROVAL_DENIED");
+    const forcedSignal = bypassHardStops ? null : await this.checkHardStops(current);
     const effectiveSignal = forcedSignal ?? signal;
     const bookkept = this.recordStep(current, effectiveSignal);
     const transition = findTransition(bookkept, effectiveSignal);
@@ -842,7 +893,19 @@ export class StateMachine {
     }
 
     const patch = transition.apply?.(bookkept, effectiveSignal) ?? {};
-    const next: TaskState = { ...bookkept, ...patch, status: transition.to };
+    let next: TaskState = { ...bookkept, ...patch, status: transition.to };
+    if (effectiveSignal.kind === "APPROVAL_GRANTED" && effectiveSignal.userGuidance) {
+      next = {
+        ...next,
+        pmContext: {
+          ...next.pmContext,
+          developerReplies: [
+            ...(next.pmContext?.developerReplies ?? []),
+            effectiveSignal.userGuidance,
+          ],
+        },
+      };
+    }
     await saveTaskState(next);
     return next;
   }

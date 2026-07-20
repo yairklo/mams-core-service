@@ -13,6 +13,14 @@ import { mountMamsRoutes } from "./router.js";
 
 let shuttingDown = false;
 
+process.on("unhandledRejection", (reason) => {
+  console.error("[server] Unhandled promise rejection (process kept alive):", reason);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[server] Uncaught exception (process kept alive):", err);
+});
+
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;

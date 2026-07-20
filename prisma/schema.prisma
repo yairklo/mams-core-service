@@ -49,3 +49,21 @@ model AgentExecutionLog {
   @@index([createdAt])
   @@schema("mams")
 }
+
+model AgentStepRecord {
+  id               String   @id @default(cuid())
+  taskId           String
+  stepId           String
+  stepIndex        Int
+  agentId          String
+  role             String
+  narrativeSummary String
+  toolCalls        Json
+  usage            Json
+  timestampMs      BigInt
+  createdAt        DateTime @default(now())
+
+  @@unique([taskId, stepId])
+  @@index([taskId, stepIndex])
+  @@schema("mams")
+}

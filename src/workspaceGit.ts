@@ -7,17 +7,151 @@ import { unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { TaskId } from "./types.js";
 
-/** Paths ignored for deliverable validation and git commits. */
-export const GIT_NOISE_PATH_PATTERNS: readonly RegExp[] = [
-  /(^|\/)package-lock\.json$/i,
-  /(^|\/)yarn\.lock$/i,
-  /(^|\/)pnpm-lock\.yaml$/i,
+/** CODER scratch / probe files — excluded from reads, git noise, and repo listings. */
+export const WORKSPACE_SCRATCH_FILE_PATTERNS: readonly RegExp[] = [
+  /(^|\/)script[^/]*\.js$/i,
+  /(^|\/)tmp_[^/]*$/i,
+];
+
+/** Heavy build/cache directories excluded from tree, search, and agent context. */
+export const WORKSPACE_HEAVY_DIR_PATTERNS: readonly RegExp[] = [
   /(^|\/)node_modules\//i,
   /(^|\/)\.git\//i,
   /(^|\/)dist\//i,
   /(^|\/)build\//i,
   /(^|\/)coverage\//i,
+  /(^|\/)\.next\//i,
+  /(^|\/)\.turbo\//i,
+  /(^|\/)out\//i,
+  /(^|\/)\.expo\//i,
+  /(^|\/)android\/\.gradle\//i,
+  /(^|\/)ios\/Pods\//i,
+  /(^|\/)\.cache\//i,
 ];
+
+/** Binary/media assets — never read, search, or list in workspace context. */
+export const WORKSPACE_BINARY_ASSET_PATTERNS: readonly RegExp[] = [
+  /\.(png|jpe?g|gif|webp|svg|ico|pck|woff2?|ttf|eot|mp4|webm|mp3|pdf|zip|tar|gz|7z|exe|dll|so|dylib|bin)$/i,
+];
+
+/** Paths ignored for deliverable validation and git commits. */
+export const GIT_NOISE_PATH_PATTERNS: readonly RegExp[] = [
+  /(^|\/)package-lock\.json$/i,
+  /(^|\/)yarn\.lock$/i,
+  /(^|\/)pnpm-lock\.yaml$/i,
+  ...WORKSPACE_HEAVY_DIR_PATTERNS,
+  ...WORKSPACE_BINARY_ASSET_PATTERNS,
+  ...WORKSPACE_SCRATCH_FILE_PATTERNS,
+];
+
+export const WORKSPACE_TREE_MAX_DEPTH = 3;
+export const WORKSPACE_TREE_MAX_ENTRIES_PER_DEPTH = 35;
+
+export function isHeavyWorkspacePath(path: string): boolean {
+  const normalized = normalizeRepoPath(path);
+  return WORKSPACE_HEAVY_DIR_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+export function isBinaryAssetPath(path: string): boolean {
+  const normalized = normalizeRepoPath(path);
+  return WORKSPACE_BINARY_ASSET_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+/** True when a path must never appear in trees, search, or read tools. */
+export function isExcludedFromWorkspaceContext(path: string): boolean {
+  const normalized = normalizeRepoPath(path);
+  if (normalized.length === 0) {
+    return true;
+  }
+  return (
+    isNoiseGitPath(normalized) ||
+    isHeavyWorkspacePath(normalized) ||
+    isBinaryAssetPath(normalized) ||
+    isWorkspaceScratchPath(normalized)
+  );
+}
+
+export interface ShallowWorkspaceTree {
+  readonly tree: string;
+  readonly fileCount: number;
+  readonly pathsConsidered: number;
+}
+
+/** Builds a shallow directory tree (depth 1–3) — no leaf-file explosion. */
+export function buildShallowWorkspaceTree(
+  paths: readonly string[],
+  options: { readonly maxDepth?: number; readonly maxEntriesPerDepth?: number } = {}
+): ShallowWorkspaceTree {
+  const maxDepth = options.maxDepth ?? WORKSPACE_TREE_MAX_DEPTH;
+  const maxEntriesPerDepth = options.maxEntriesPerDepth ?? WORKSPACE_TREE_MAX_ENTRIES_PER_DEPTH;
+  const filtered = paths.filter((path) => !isExcludedFromWorkspaceContext(path));
+  const depthBuckets = new Map<number, Set<string>>();
+
+  for (const path of filtered) {
+    const parts = path.split("/").filter((part) => part.length > 0);
+    if (parts.length === 0) {
+      continue;
+    }
+    for (let depth = 1; depth <= Math.min(maxDepth, parts.length); depth += 1) {
+      const prefix = parts.slice(0, depth).join("/");
+      const bucket = depthBuckets.get(depth) ?? new Set<string>();
+      bucket.add(prefix);
+      depthBuckets.set(depth, bucket);
+    }
+  }
+
+  const lines: string[] = [
+    `## Workspace layout (shallow, max depth ${maxDepth})`,
+    "Heavy dirs (.next, dist, node_modules, binaries) omitted.",
+  ];
+  for (let depth = 1; depth <= maxDepth; depth += 1) {
+    const bucket = depthBuckets.get(depth);
+    if (!bucket || bucket.size === 0) {
+      continue;
+    }
+    const sorted = [...bucket].sort();
+    const shown = sorted.slice(0, maxEntriesPerDepth);
+    lines.push(`### Depth ${depth}`, ...shown);
+    if (sorted.length > shown.length) {
+      lines.push(`… +${sorted.length - shown.length} more at depth ${depth}`);
+    }
+  }
+
+  const deeperPaths = filtered.filter((path) => path.split("/").filter(Boolean).length > maxDepth).length;
+  if (deeperPaths > 0) {
+    lines.push(`(${deeperPaths} deeper file paths omitted — use search_files / read_file_slice)`);
+  }
+
+  return {
+    tree: lines.join("\n"),
+    fileCount: filtered.length,
+    pathsConsidered: paths.length,
+  };
+}
+
+export async function listFilteredRepoPaths(
+  runGit: GitProcessRunner,
+  pathPrefix = "."
+): Promise<string[]> {
+  const prefix = normalizeRepoPath(pathPrefix);
+  const args =
+    prefix === "." || prefix.length === 0
+      ? (["ls-files", "--cached", "--others", "--exclude-standard"] as const)
+      : (["ls-files", "--cached", "--others", "--exclude-standard", "--", prefix] as const);
+  const result = await runGit.run(args, "git_ls_files_filtered");
+  if (result.exitCode !== 0) {
+    return [];
+  }
+  return result.stdout
+    .split("\n")
+    .map((line) => normalizeRepoPath(line.trim()))
+    .filter((line) => line.length > 0 && !isExcludedFromWorkspaceContext(line));
+}
+
+export function isWorkspaceScratchPath(path: string): boolean {
+  const normalized = normalizeRepoPath(path);
+  return WORKSPACE_SCRATCH_FILE_PATTERNS.some((pattern) => pattern.test(normalized));
+}
 
 /** Directories that count as meaningful product changes. */
 export const MEANINGFUL_SOURCE_PREFIXES: readonly string[] = [
@@ -61,7 +195,6 @@ export function isMeaningfulSourcePath(path: string): boolean {
   );
 }
 
-/** Parses `git status --porcelain` paths (XY␠PATH or XY␠OLD -> NEW). */
 export function parseChangedPathsFromPorcelain(porcelain: string): string[] {
   const paths: string[] = [];
   for (const line of porcelain.split("\n")) {
@@ -76,6 +209,21 @@ export function parseChangedPathsFromPorcelain(porcelain: string): string[] {
     if (pathPart.includes(" -> ")) {
       pathPart = normalizeRepoPath(pathPart.split(" -> ").pop()?.trim() ?? pathPart);
     }
+    if (pathPart.length > 0) {
+      paths.push(pathPart);
+    }
+  }
+  return [...new Set(paths)];
+}
+
+/** Parses untracked (`??`) paths from `git status --porcelain`. */
+export function parseUntrackedPathsFromPorcelain(porcelain: string): string[] {
+  const paths: string[] = [];
+  for (const line of porcelain.split("\n")) {
+    if (!line.startsWith("?? ")) {
+      continue;
+    }
+    const pathPart = normalizeRepoPath(line.slice(3));
     if (pathPart.length > 0) {
       paths.push(pathPart);
     }

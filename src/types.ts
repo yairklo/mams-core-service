@@ -310,7 +310,7 @@ export type TaskSignal =
   | { readonly kind: "BUDGET_EXCEEDED"; readonly scope: "STEPS" | "TOKENS" | "COST" | "TIME" }
   | { readonly kind: "SOFT_BUDGET_WARNING"; readonly reason: string }
   | { readonly kind: "FUSE_TRIPPED"; readonly reason: string }
-  | { readonly kind: "APPROVAL_GRANTED"; readonly by: string }
+  | { readonly kind: "APPROVAL_GRANTED"; readonly by: string; readonly userGuidance?: string }
   | { readonly kind: "APPROVAL_DENIED"; readonly by: string }
   | { readonly kind: "DELIVERABLE_REJECTED"; readonly reason: string }
   | { readonly kind: "ARCHITECTURE_REQUIRED" }

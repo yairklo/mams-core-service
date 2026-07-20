@@ -29,7 +29,9 @@ import {
   type ToolCallRequest,
   type ToolCallResult,
 } from "./types.js";
-import { createListRepoStructureTool, createReadFileTool, createToolSet, PROJECT_RULES_FILENAME, PROJECT_RULES_SECTION_HEADER, readBlueprintStep, resolveSandboxPath } from "./tools.js";
+import { createListRepoStructureTool, createReadFileTool, createReadFileSliceTool, createSearchFilesTool, createToolSet, createVerifierReadFileTool, clearReadFileTurnCache, PROJECT_RULES_FILENAME, PROJECT_RULES_SECTION_HEADER, readBlueprintStep, resolveSandboxPath } from "./tools.js";
+import { wrapToolsForTaskProgress } from "./taskObservability.js";
+import { createPrepareStepTrimmer, MAX_CODER_PRIOR_STEPS, MAX_RECENT_TOOL_TURNS } from "./contextTrimming.js";
 
 export { PROJECT_RULES_FILENAME, PROJECT_RULES_SECTION_HEADER };
 
@@ -167,6 +169,8 @@ export function buildToolsForRole(role: AgentRole, sandboxRoot: string) {
       return {
         write_file: full.write_file,
         read_file: full.read_file,
+        read_file_slice: full.read_file_slice,
+        search_files: full.search_files,
         list_changed_files: full.list_changed_files,
         run_local_tests: full.run_local_tests,
       };
@@ -180,6 +184,8 @@ export function buildToolsForRole(role: AgentRole, sandboxRoot: string) {
     case "SUPERVISOR":
       return {
         read_file: full.read_file,
+        read_file_slice: full.read_file_slice,
+        search_files: full.search_files,
         list_changed_files: full.list_changed_files,
         run_local_tests: full.run_local_tests,
         execute_claude_code_escalation: full.execute_claude_code_escalation,
@@ -188,7 +194,9 @@ export function buildToolsForRole(role: AgentRole, sandboxRoot: string) {
     case "QA":
     case "SPEC_REVIEWER":
       return {
-        read_file: full.read_file,
+        read_file: createVerifierReadFileTool(sandboxRoot),
+        read_file_slice: createReadFileSliceTool(sandboxRoot, { verifierMode: true }),
+        search_files: createSearchFilesTool(sandboxRoot, { verifierMode: true }),
         list_changed_files: full.list_changed_files,
         run_local_tests: full.run_local_tests,
       };
@@ -268,7 +276,7 @@ async function buildUserPrompt(role: AgentRole, context: AgentTaskContext): Prom
     );
     sections.push(
       [
-        `## Prior step history (${priorSteps.length})`,
+        `## Prior step history (last ${priorSteps.length}${role === "CODER" ? `, max ${MAX_CODER_PRIOR_STEPS}` : ""})`,
         isVerifierRole
           ? "Narratives below are SELF-REPORTED — verify independently against the Task Contract."
           : null,
@@ -490,7 +498,12 @@ export async function runAgent(
 
   const { system } = await compileSystemPrompt(role, context.sandboxRoot, taskId);
   const prompt = await buildUserPrompt(role, context);
-  const tools = options.useSandbox === false ? undefined : buildToolsForRole(role, context.sandboxRoot);
+  clearReadFileTurnCache(context.sandboxRoot);
+  const rawTools = options.useSandbox === false ? undefined : buildToolsForRole(role, context.sandboxRoot);
+  const tools =
+    rawTools && options.useSandbox !== false
+      ? wrapToolsForTaskProgress(taskId, role, rawTools)
+      : rawTools;
 
   const stepId = computeStepId(taskId, stepIndex, { role, modelId, objective: context.contract.objective });
   const maxToolRoundtrips = options.maxToolRoundtrips ?? resolveMaxToolRoundtripsForRole(role);
@@ -500,11 +513,14 @@ export async function runAgent(
 
   let result;
   try {
+    const prepareStep =
+      tools && role === "CODER" ? createPrepareStepTrimmer(MAX_RECENT_TOOL_TURNS) : undefined;
     result = await generateText({
       model,
       system,
       prompt,
       ...(tools ? { tools } : {}),
+      ...(prepareStep ? { prepareStep } : {}),
       stopWhen: stepCountIs(maxToolRoundtrips),
       abortSignal: abortController.signal,
     });
@@ -515,6 +531,7 @@ export async function runAgent(
     throw err;
   } finally {
     clearTimeout(timeoutHandle);
+    clearReadFileTurnCache(context.sandboxRoot);
   }
 
   const activity = collectToolActivity(result.steps);

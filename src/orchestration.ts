@@ -14,10 +14,12 @@ import {
   resolveAgentRoleForStatus,
   StateMachine,
 } from "./fsmEngine.js";
+import type { AgentRole } from "./actors.js";
 import {
   createSandboxGitRunner,
   finalizeGitWorkspace,
   initializeGitWorkspace,
+  cleanupWorkspaceScratchFiles,
   readBlueprintStep,
   readBlueprintSteps,
   validateArchitectureArtifacts,
@@ -32,6 +34,15 @@ import {
 } from "./types.js";
 import { collectWorkspaceChanges, releaseWorkspaceDiskLocks } from "./workspaceGit.js";
 import { cleanupDockerContainers, killAllTrackedProcesses } from "./processRegistry.js";
+import {
+  beginAgentTurn,
+  clearLiveTaskProgress,
+  endAgentTurn,
+  getLiveTaskProgress,
+  logCompletedStepTools,
+  type LiveTaskProgress,
+} from "./taskObservability.js";
+import { loadStepRecords, saveStepRecord } from "./database.js";
 import type { TaskStatus } from "./types.js";
 
 export interface TaskRuntimeSnapshot {
@@ -52,6 +63,8 @@ export interface TaskRuntimeSnapshot {
   readonly lastStepRole: string | null;
   readonly lastStepSummary: string | null;
   readonly branch: string | null;
+  readonly orchestrationRunning: boolean;
+  readonly liveProgress: LiveTaskProgress;
 }
 
 const runtimeByTask = new Map<TaskId, TaskRuntimeSnapshot>();
@@ -142,7 +155,25 @@ async function refreshRuntimeSnapshot(
     // workspace may not be git-backed
   }
 
+  const persistedRows = priorSteps.length > 0 ? null : await loadStepRecords(taskId);
+  const tokenUsage =
+    priorSteps.length > 0
+      ? summarizeTokenUsage(priorSteps)
+      : summarizeTokenUsage(
+          (persistedRows ?? []).map((row) => ({
+            stepId: row.stepId as StepResult["stepId"],
+            taskId,
+            agentId: row.agentId as StepResult["agentId"],
+            toolCalls: [],
+            producedArtifacts: [],
+            narrativeSummary: row.narrativeSummary,
+            usage: row.usage,
+            timestampMs: row.timestampMs,
+          }))
+        );
+
   const lastStep = priorSteps.at(-1) ?? null;
+  const lastPersisted = persistedRows?.at(-1) ?? null;
   const snapshot: TaskRuntimeSnapshot = {
     taskId,
     status: state.status,
@@ -153,10 +184,12 @@ async function refreshRuntimeSnapshot(
     architectureAlignmentStatus: state.architectureAlignmentStatus,
     changedFiles,
     meaningfulChangedFiles,
-    tokenUsage: summarizeTokenUsage(priorSteps),
-    lastStepRole: lastStep?.agentId ?? null,
-    lastStepSummary: lastStep?.narrativeSummary ?? null,
+    tokenUsage,
+    lastStepRole: lastStep?.agentId ?? lastPersisted?.agentId ?? null,
+    lastStepSummary: lastStep?.narrativeSummary ?? lastPersisted?.narrativeSummary ?? null,
     branch,
+    orchestrationRunning: isOrchestrationRunning(taskId),
+    liveProgress: getLiveTaskProgress(taskId),
   };
   runtimeByTask.set(taskId, snapshot);
   return snapshot;
@@ -164,6 +197,16 @@ async function refreshRuntimeSnapshot(
 
 function shouldAutoApproveBlueprint(): boolean {
   return loadMamsEnv().MAMS_AUTO_APPROVE_BLUEPRINT;
+}
+
+async function persistCompletedStep(
+  taskId: TaskId,
+  role: AgentRole,
+  stepIndex: number,
+  stepResult: StepResult
+): Promise<void> {
+  logCompletedStepTools(taskId, role, stepResult);
+  await saveStepRecord(taskId, stepIndex, role, stepResult);
 }
 
 async function prepareArchitectureIfNeeded(
@@ -318,6 +361,11 @@ export async function runTaskOrchestration(
     await runTaskOrchestrationInner(sm, taskId, sandboxRoot, priorSteps, maxIterations, abortController.signal);
   } finally {
     orchestrationAbortControllers.delete(taskId);
+    endAgentTurn(taskId);
+    clearLiveTaskProgress(taskId);
+    await cleanupWorkspaceScratchFiles(sandboxRoot).catch((err) => {
+      console.warn(`[orchestrator] Scratch cleanup failed for "${taskId}":`, err);
+    });
   }
 }
 
@@ -422,8 +470,19 @@ async function runTaskOrchestrationInner(
       const previousStatus = state.status;
       const executedBlueprintStepIndex =
         role === "CODER" && state.blueprintTotalSteps > 0 ? state.blueprintStepIndex : -1;
-      const { state: nextState, stepResult } = await sm.executeAgentTurn(taskId, role, sandboxRoot, priorSteps);
+      beginAgentTurn(taskId, role);
+      let stepResult: StepResult;
+      let nextState: TaskState;
+      try {
+        ({ state: nextState, stepResult } = await sm.executeAgentTurn(taskId, role, sandboxRoot, priorSteps));
+      } finally {
+        endAgentTurn(taskId);
+      }
       priorSteps.push(stepResult);
+      await persistCompletedStep(taskId, role, nextState.history.length - 1, stepResult);
+      await cleanupWorkspaceScratchFiles(sandboxRoot).catch((err) => {
+        console.warn(`[orchestrator] Scratch cleanup failed after step for "${taskId}":`, err);
+      });
 
       if (role === "ARCHITECT" && previousStatus === "ARCHITECTING") {
         const architectOutcome = await afterArchitectTurn(sm, taskId, sandboxRoot, stepResult, priorSteps);
@@ -471,7 +530,15 @@ async function runTaskOrchestrationInner(
         console.error(`[orchestrator] Invalid transition for "${taskId}":`, err.message);
         return;
       }
-      throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[orchestrator] Task "${taskId}" orchestration error (${role ?? "unknown"}):`, message);
+      try {
+        const failedState = await sm.getTaskState(taskId);
+        await refreshRuntimeSnapshot(taskId, failedState, priorSteps, sandboxRoot);
+      } catch {
+        // Best-effort snapshot before stopping the loop.
+      }
+      return;
     }
   }
 
