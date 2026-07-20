@@ -292,6 +292,7 @@ function MamsDashboard() {
             <window.Timeline
               steps={steps}
               getRoleColor={getRoleColor}
+              blueprintSteps={taskDetail.blueprintSteps || []}
             />
           </>
         )}

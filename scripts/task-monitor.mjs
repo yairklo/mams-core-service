@@ -54,6 +54,9 @@ async function tick() {
 
   if (!t.orchestrationRunning && t.status !== "AWAITING_APPROVAL") {
     const r = await resume();
+    if (r.error === "Orchestration is already running for this task.") {
+      return "wait";
+    }
     console.log(`  -> resume: ${JSON.stringify(r)}`);
     return "acted";
   }

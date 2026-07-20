@@ -2,7 +2,27 @@
 
 const { useState } = React;
 
-window.Timeline = ({ steps, getRoleColor }) => {
+const getToolCallSummary = (toolName, args) => {
+  if (!args) return "Executing " + toolName;
+  switch (toolName) {
+    case "read_file":
+      return "📖 Reading file: " + (args.path || "");
+    case "read_file_slice":
+      return "📄 Reading lines " + (args.startLine || 1) + " to " + ((args.startLine || 1) + (args.lineCount || 0)) + " of " + (args.path || "");
+    case "write_file":
+      return "💾 Writing/Updating file: " + (args.path || "");
+    case "search_files":
+      return "🔍 Searching for query '" + (args.query || "") + "'" + (args.pathPrefix ? " in " + args.pathPrefix : "");
+    case "run_local_tests":
+      return "🧪 Running test: " + (args.command || "") + " " + (args.args ? (Array.isArray(args.args) ? args.args.join(" ") : args.args) : "");
+    case "list_changed_files":
+      return "🌿 Checking for changed files in git workspace";
+    default:
+      return "⚙️ Executing tool: " + toolName;
+  }
+};
+
+window.Timeline = ({ steps, getRoleColor, blueprintSteps }) => {
   const [expandedSteps, setExpandedSteps] = useState({});
 
   const toggleStep = (stepId) => {
@@ -57,6 +77,19 @@ window.Timeline = ({ steps, getRoleColor }) => {
                   </div>
                 </div>
 
+                {/* Blueprint Step Context */}
+                {step.usage && typeof step.usage.blueprintStepIndex === "number" && blueprintSteps && blueprintSteps[step.usage.blueprintStepIndex] && (
+                  <div className="bg-blue-500/10 border border-blue-500/20 text-blue-300 rounded-lg p-2.5 text-xs flex items-center gap-2">
+                    <svg className="h-4 w-4 text-blue-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                    </svg>
+                    <span>
+                      <span className="font-semibold text-blue-400">Blueprint Target:</span>{" "}
+                      {blueprintSteps[step.usage.blueprintStepIndex]}
+                    </span>
+                  </div>
+                )}
+
                 <div className="text-sm text-gray-300 leading-relaxed whitespace-pre-wrap">
                   {step.narrativeSummary}
                 </div>
@@ -87,7 +120,7 @@ window.Timeline = ({ steps, getRoleColor }) => {
                           >
                             <div className="flex items-center justify-between">
                               <span className="font-semibold text-gray-200">
-                                call: <span className="text-sky-400">{call.toolName}</span>
+                                {getToolCallSummary(call.toolName, call.args)}
                               </span>
                               <span className="flex items-center gap-1">
                                 {call.ok ? <window.CheckCircleIcon /> : <window.XCircleIcon />}

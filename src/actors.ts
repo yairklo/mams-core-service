@@ -29,7 +29,7 @@ import {
   type ToolCallRequest,
   type ToolCallResult,
 } from "./types.js";
-import { createListRepoStructureTool, createReadFileTool, createReadFileSliceTool, createSearchFilesTool, createToolSet, createVerifierReadFileTool, clearReadFileTurnCache, PROJECT_RULES_FILENAME, PROJECT_RULES_SECTION_HEADER, readBlueprintStep, resolveSandboxPath } from "./tools.js";
+import { createCoderToolSet, createListRepoStructureTool, createReadFileTool, createReadFileSliceTool, createSearchFilesTool, createToolSet, createVerifierReadFileTool, clearReadFileTurnCache, PROJECT_RULES_FILENAME, PROJECT_RULES_SECTION_HEADER, readBlueprintStep, resolveSandboxPath } from "./tools.js";
 import { wrapToolsForTaskProgress } from "./taskObservability.js";
 import { createPrepareStepTrimmer, MAX_CODER_PRIOR_STEPS, MAX_RECENT_TOOL_TURNS } from "./contextTrimming.js";
 
@@ -162,18 +162,15 @@ export async function compileSystemPrompt(
   }
 }
 
-export function buildToolsForRole(role: AgentRole, sandboxRoot: string) {
+export function buildToolsForRole(
+  role: AgentRole,
+  sandboxRoot: string,
+  blueprintStepText?: string | null
+) {
   const full = createToolSet(sandboxRoot);
   switch (role) {
     case "CODER":
-      return {
-        write_file: full.write_file,
-        read_file: full.read_file,
-        read_file_slice: full.read_file_slice,
-        search_files: full.search_files,
-        list_changed_files: full.list_changed_files,
-        run_local_tests: full.run_local_tests,
-      };
+      return createCoderToolSet(sandboxRoot, blueprintStepText);
     case "ARCHITECT":
       return {
         write_file: full.write_file,
@@ -499,7 +496,12 @@ export async function runAgent(
   const { system } = await compileSystemPrompt(role, context.sandboxRoot, taskId);
   const prompt = await buildUserPrompt(role, context);
   clearReadFileTurnCache(context.sandboxRoot);
-  const rawTools = options.useSandbox === false ? undefined : buildToolsForRole(role, context.sandboxRoot);
+  const blueprintStepText =
+    role === "CODER" && context.blueprintStepIndex !== undefined
+      ? await readBlueprintStep(context.sandboxRoot, context.blueprintStepIndex)
+      : null;
+  const rawTools =
+    options.useSandbox === false ? undefined : buildToolsForRole(role, context.sandboxRoot, blueprintStepText);
   const tools =
     rawTools && options.useSandbox !== false
       ? wrapToolsForTaskProgress(taskId, role, rawTools)

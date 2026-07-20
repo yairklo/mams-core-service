@@ -42,7 +42,7 @@ import {
   logCompletedStepTools,
   type LiveTaskProgress,
 } from "./taskObservability.js";
-import { loadStepRecords, saveStepRecord } from "./database.js";
+import { loadStepRecords, saveStepRecord, saveTaskState } from "./database.js";
 import type { TaskStatus } from "./types.js";
 
 export interface TaskRuntimeSnapshot {
@@ -494,6 +494,9 @@ async function runTaskOrchestrationInner(
       } finally {
         endAgentTurn(taskId);
       }
+      if (role === "CODER" && state.blueprintTotalSteps > 0) {
+        (stepResult.usage as any).blueprintStepIndex = state.blueprintStepIndex;
+      }
       await cleanupWorkspaceScratchFiles(sandboxRoot).catch((err) => {
         console.warn(`[orchestrator] Scratch cleanup failed after step for "${taskId}":`, err);
       });
@@ -559,6 +562,21 @@ async function runTaskOrchestrationInner(
         return;
       }
       const message = err instanceof Error ? err.message : String(err);
+      if (role === "CODER" && /invalid x-api-key|api key|authentication/i.test(message)) {
+        try {
+          const failedState = await sm.getTaskState(taskId);
+          if (failedState.preferredProvider !== "GOOGLE") {
+            console.warn(
+              `[orchestrator] LLM auth error for "${taskId}" — resetting preferredProvider to GOOGLE and retrying.`
+            );
+            await saveTaskState({ ...failedState, preferredProvider: "GOOGLE" });
+            await refreshRuntimeSnapshot(taskId, failedState, priorSteps, sandboxRoot);
+            continue;
+          }
+        } catch {
+          // Fall through to stop orchestration.
+        }
+      }
       console.error(`[orchestrator] Task "${taskId}" orchestration error (${role ?? "unknown"}):`, message);
       try {
         const failedState = await sm.getTaskState(taskId);
