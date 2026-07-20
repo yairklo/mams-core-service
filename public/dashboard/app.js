@@ -266,6 +266,9 @@ function MamsDashboard() {
               costByRole={costByRole}
             />
 
+            {/* Task Contract & Blueprint */}
+            <window.ContractBlueprint taskDetail={taskDetail} />
+
             {/* Dashboard grid panel */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               {/* Metadata Sidebar */}

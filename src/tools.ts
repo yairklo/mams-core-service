@@ -32,7 +32,7 @@ import {
   buildClaudeCodeSpawnEnv,
   checkClaudeCodeAvailability,
 } from "./claudeCode.js";
-import { validateArchitectStepResult } from "./deliverableValidation.js";
+import { isBlueprintVerifyStep, validateArchitectStepResult } from "./deliverableValidation.js";
 import { registerChildProcess, registerDockerContainerId } from "./processRegistry.js";
 import { releaseDevServerPorts } from "./portCleanup.js";
 import type { StepResult } from "./types.js";

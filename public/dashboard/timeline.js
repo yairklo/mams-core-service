@@ -45,6 +45,9 @@ window.Timeline = ({ steps, getRoleColor }) => {
                     <span className="flex items-center gap-1 font-mono text-[10px] bg-gray-900 px-2 py-0.5 rounded">
                       <window.CoinsIcon /> {"$" + (step.usage?.estimatedCostUsd || 0).toFixed(4)}
                     </span>
+                    <span className="flex items-center gap-1 font-mono text-[10px] bg-gray-900 px-2 py-0.5 rounded text-gray-450" title="Tokens (Input / Output)">
+                      In: {(step.usage?.inputTokens || 0).toLocaleString()} | Out: {(step.usage?.outputTokens || 0).toLocaleString()}
+                    </span>
                     <span className="flex items-center gap-1 font-mono text-[10px] bg-gray-900 px-2 py-0.5 rounded">
                       {step.usage?.modelId || "unknown"}
                     </span>

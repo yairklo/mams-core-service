@@ -8,7 +8,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 
-import { mkdirSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync } from "node:fs";
 
 import { join } from "node:path";
 
@@ -626,6 +626,38 @@ export function createMamsRouter(deps: MamsRouterDeps = {}): Router {
     }
   });
 
+  function loadBlueprintSteps(tId: string): string[] {
+    const blueprintPath = join(AGENT_WORKSPACES_BASE_DIR, tId, "task-blueprint.md");
+    if (!existsSync(blueprintPath)) {
+      return [];
+    }
+    try {
+      const content = readFileSync(blueprintPath, "utf8");
+      const lines = content.split("\n");
+      const stepsList: string[] = [];
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("- [ ]") || trimmed.startsWith("- [x]") || trimmed.startsWith("- [/]")) {
+          const taskText = trimmed.replace(/^-\s*\[[ x\/]\]\s*/i, "").trim();
+          if (taskText) stepsList.push(taskText);
+        } else if (trimmed.startsWith("-") || trimmed.startsWith("*")) {
+          const taskText = trimmed.replace(/^[-*]\s*/, "").trim();
+          if (taskText && !taskText.toLowerCase().startsWith("goal") && !taskText.toLowerCase().startsWith("acceptance")) {
+            stepsList.push(taskText);
+          }
+        } else {
+          const match = trimmed.match(/^\d+\.\s+(.*)$/);
+          if (match && match[1]) {
+            stepsList.push(match[1].trim());
+          }
+        }
+      }
+      return stepsList;
+    } catch {
+      return [];
+    }
+  }
+
   router.get("/task/:taskId", async (req: Request, res: Response) => {
     const taskId = parseTaskIdParam(req.params.taskId);
     if (!taskId) {
@@ -657,6 +689,17 @@ export function createMamsRouter(deps: MamsRouterDeps = {}): Router {
         runtime,
         recentTools,
         liveProgress,
+        objective: state.contract.objective,
+        acceptanceCriteria: state.contract.acceptanceCriteria,
+        createdAt: state.contract.createdAt,
+        deadlineMs: state.deadline.absoluteMs,
+        sessionId: state.sessionId,
+        parentTaskId: state.parentTaskId,
+        retry: state.retry,
+        optimization: state.optimization,
+        preferredProvider: state.preferredProvider,
+        modelOverride: state.modelOverride,
+        blueprintSteps: loadBlueprintSteps(taskId),
       });
     } catch {
       res.status(404).json({ error: "Task not found" });
