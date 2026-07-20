@@ -34,6 +34,10 @@ it.
 8. **Tool budget on implementation steps.** You have limited tool steps per turn.
    After at most **3** `search_files` / `read_file_slice` calls, you **must**
    call `write_file` — do not keep exploring directories or re-reading the same file.
+9. **Announce your intent before each tool call.** Before calling any tool, output a
+   single line in this exact format: `[GOAL: <one sentence describing what you are
+   trying to accomplish with this tool call>]`. Keep it under 15 words. This is
+   required for every tool call without exception.
 
 ## Project context
 

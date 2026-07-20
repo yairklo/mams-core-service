@@ -129,14 +129,11 @@ window.Timeline = ({ steps, getRoleColor, blueprintSteps }) => {
                             </div>
 
                             {call.reasoning && (
-                              <div className="text-xs text-blue-300 bg-blue-950/25 border border-blue-900/35 p-2.5 rounded-lg leading-relaxed whitespace-pre-wrap font-sans">
-                                <span className="font-semibold text-blue-400">💡 Agent rationale:</span> {call.reasoning}
-                              </div>
-                            )}
-
-                            {call.args && (
-                              <div className="bg-gray-955 p-2 rounded border border-gray-900 text-[10px] text-gray-400 overflow-x-auto">
-                                args: {JSON.stringify(call.args, null, 2)}
+                              <div className="flex items-start gap-2 text-xs text-amber-300 bg-amber-950/20 border border-amber-700/30 px-3 py-2 rounded-lg font-sans">
+                                <svg className="h-3.5 w-3.5 text-amber-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
+                                  <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                </svg>
+                                <span><span className="font-semibold text-amber-400">Goal:</span> {call.reasoning}</span>
                               </div>
                             )}
 

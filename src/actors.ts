@@ -305,11 +305,19 @@ interface ToolActivity {
   readonly reasoning?: string | undefined;
 }
 
+/** Extract `[GOAL: ...]` tag written by the CODER before each tool call. */
+function extractGoalTag(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const match = text.match(/\[GOAL:\s*([^\]]+)\]/);
+  const group = match?.[1];
+  return group ? group.trim() : undefined;
+}
+
 function collectToolActivity(steps: readonly { content: readonly GenericContentPart[] }[]): ToolActivity[] {
   const byId = new Map<string, ToolActivity>();
   for (const step of steps) {
     const textPart = step.content.find((part) => part.type === "text") as { text: string } | undefined;
-    const reasoning = textPart?.text?.trim() || undefined;
+    const goal = extractGoalTag(textPart?.text);
 
     for (const part of step.content) {
       if (!part.toolCallId) continue;
@@ -321,7 +329,7 @@ function collectToolActivity(steps: readonly { content: readonly GenericContentP
           input: part.input,
           output: existing?.output,
           error: existing?.error,
-          reasoning: reasoning ?? existing?.reasoning,
+          reasoning: goal ?? existing?.reasoning,
         });
       } else if (part.type === "tool-result") {
         byId.set(part.toolCallId, {
@@ -330,7 +338,7 @@ function collectToolActivity(steps: readonly { content: readonly GenericContentP
           input: existing?.input ?? part.input,
           output: part.output,
           error: existing?.error,
-          reasoning: existing?.reasoning ?? reasoning,
+          reasoning: existing?.reasoning ?? goal,
         });
       } else if (part.type === "tool-error") {
         byId.set(part.toolCallId, {
@@ -339,7 +347,7 @@ function collectToolActivity(steps: readonly { content: readonly GenericContentP
           input: existing?.input ?? part.input,
           output: existing?.output,
           error: part.error,
-          reasoning: existing?.reasoning ?? reasoning,
+          reasoning: existing?.reasoning ?? goal,
         });
       }
     }
