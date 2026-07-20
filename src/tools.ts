@@ -1149,6 +1149,127 @@ export function createToolSet(sandboxRoot: string): ToolSet {
   };
 }
 
+const CODER_MAX_EXPLORE_BEFORE_WRITE = 4;
+const CODER_IMPL_TEST_MAX_TIMEOUT_MS = 90_000;
+
+const CODER_PROBE_COMMAND_PATTERNS: readonly RegExp[] = [
+  /^\s*(ls|dir|tree|find|cat|head|tail|wc|grep|bash|sh)\b/i,
+  /\bnode\s+-e\b.*\b(readdir|readFile|writeFile|replace)\b/i,
+  /\b(sed|awk)\s+.*(-i|--in-place)/i,
+];
+
+function isCoderProbeShellCommand(command: string, args: readonly string[]): boolean {
+  const joined = [command, ...args].join(" ").trim();
+  return CODER_PROBE_COMMAND_PATTERNS.some((pattern) => pattern.test(joined));
+}
+
+function bindToolExecute(agentTool: any): (input: any) => Promise<any> {
+  const execute = agentTool.execute;
+  if (!execute) {
+    throw new Error("Tool is missing execute handler.");
+  }
+  return (input: any) => execute(input);
+}
+
+/** CODER tools with exploration limits and write_file-before-tests enforcement on implementation steps. */
+export function createCoderToolSet(sandboxRoot: string, blueprintStepText: string | null | undefined) {
+  const full = createToolSet(sandboxRoot);
+  const isVerifyStep = isBlueprintVerifyStep(blueprintStepText);
+  let hasSuccessfulWriteFile = false;
+  let exploreOps = 0;
+
+  const gateExplore = (): void => {
+    if (isVerifyStep || hasSuccessfulWriteFile) {
+      return;
+    }
+    exploreOps += 1;
+    if (exploreOps > CODER_MAX_EXPLORE_BEFORE_WRITE) {
+      throw new Error(
+        `Exploration limit (${CODER_MAX_EXPLORE_BEFORE_WRITE}) reached without write_file. Call write_file now to implement this blueprint step.`
+      );
+    }
+  };
+
+  const writeExecute = bindToolExecute(full.write_file);
+  const readExecute = bindToolExecute(full.read_file);
+  const sliceExecute = bindToolExecute(full.read_file_slice);
+  const searchExecute = bindToolExecute(full.search_files);
+  const listChangedExecute = bindToolExecute(full.list_changed_files);
+  const testsExecute = bindToolExecute(full.run_local_tests);
+
+  return {
+    write_file: tool({
+      description: "Writes a file within the task sandbox. Overwrites if exists.",
+      inputSchema: WriteFileInputSchema,
+      execute: async (input) => {
+        const result = (await writeExecute(input)) as { readonly verifiedReadBack?: boolean };
+        if (result.verifiedReadBack !== false) {
+          hasSuccessfulWriteFile = true;
+        }
+        return result;
+      },
+    }),
+    read_file: tool({
+      description: full.read_file.description ?? "Reads a file within the task sandbox.",
+      inputSchema: ReadFileInputSchema,
+      execute: async (input) => {
+        gateExplore();
+        return readExecute(input);
+      },
+    }),
+    read_file_slice: tool({
+      description: full.read_file_slice.description ?? "Reads a line range from a file in the sandbox.",
+      inputSchema: ReadFileSliceInputSchema,
+      execute: async (input) => {
+        gateExplore();
+        return sliceExecute(input);
+      },
+    }),
+    search_files: tool({
+      description: full.search_files.description ?? "Search for a pattern in repo files.",
+      inputSchema: SearchFilesInputSchema,
+      execute: async (input) => {
+        gateExplore();
+        return searchExecute(input);
+      },
+    }),
+    list_changed_files: tool({
+      description: full.list_changed_files.description ?? "Lists meaningful changed files in the workspace.",
+      inputSchema: z.object({}).default({}),
+      execute: async (input) => listChangedExecute(input),
+    }),
+    run_local_tests: tool({
+      description: full.run_local_tests.description ?? "Runs a test/build/lint command in the task sandbox.",
+      inputSchema: RunLocalTestsInputSchema,
+      execute: async (input) => {
+        const parsed = RunLocalTestsInputSchema.parse(input);
+        if (!isVerifyStep && !hasSuccessfulWriteFile) {
+          return {
+            exitCode: 1,
+            stdout: "",
+            stderr:
+              "[MAMS] Implementation blueprint step: call write_file before run_local_tests. Shell probes (ls/cat/sed/node -e) are blocked — edit source with write_file.",
+            timedOut: false,
+            durationMs: 0,
+          } satisfies RunLocalTestsOutput;
+        }
+        if (isCoderProbeShellCommand(parsed.command, parsed.args)) {
+          return {
+            exitCode: 1,
+            stdout: "",
+            stderr:
+              "[MAMS] Refusing probe/shell-mutation command. Use search_files + read_file_slice, then write_file.",
+            timedOut: false,
+            durationMs: 0,
+          } satisfies RunLocalTestsOutput;
+        }
+        const timeoutMs = Math.min(parsed.timeoutMs, CODER_IMPL_TEST_MAX_TIMEOUT_MS);
+        return testsExecute({ ...parsed, timeoutMs });
+      },
+    }),
+  };
+}
+
 /** @deprecated Prefer buildCleanGitRepoUrl + gitHttpAuthConfigArgs — never persist tokens in git config. */
 export function buildAuthenticatedGitCloneUrl(repoUrl: string, token: string): string {
   const parsed = new URL(repoUrl);
