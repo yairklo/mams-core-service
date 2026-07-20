@@ -272,6 +272,7 @@ export interface ToolCallRequest<TArgs = unknown> {
   readonly argsHash: string;
   readonly locks: readonly ResourceLockManifest[];
   readonly requestedBy: AgentId;
+  readonly reasoning?: string;
 }
 
 export type ToolCallResult<TOutput = unknown> =

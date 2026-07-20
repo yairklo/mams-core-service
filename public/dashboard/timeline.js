@@ -128,6 +128,12 @@ window.Timeline = ({ steps, getRoleColor, blueprintSteps }) => {
                               </span>
                             </div>
 
+                            {call.reasoning && (
+                              <div className="text-xs text-blue-300 bg-blue-950/25 border border-blue-900/35 p-2.5 rounded-lg leading-relaxed whitespace-pre-wrap font-sans">
+                                <span className="font-semibold text-blue-400">💡 Agent rationale:</span> {call.reasoning}
+                              </div>
+                            )}
+
                             {call.args && (
                               <div className="bg-gray-955 p-2 rounded border border-gray-900 text-[10px] text-gray-400 overflow-x-auto">
                                 args: {JSON.stringify(call.args, null, 2)}

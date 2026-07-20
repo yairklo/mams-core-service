@@ -78,6 +78,14 @@ function pickBestPreferredMatch(models: readonly string[], preferredModelId: str
   return best?.id ?? null;
 }
 
+function preferStableGemini15(models: readonly string[]): readonly string[] {
+  const stable15 = models.filter((modelId) => {
+    const lower = modelId.toLowerCase();
+    return lower.includes("1.5") || lower.includes("1-5");
+  });
+  return stable15.length > 0 ? stable15 : models;
+}
+
 function pickLatestGeminiTier(models: readonly string[], tier: GoogleModelTier): string | null {
   const candidates = models.filter((modelId) => {
     const lower = modelId.toLowerCase();
@@ -90,12 +98,22 @@ function pickLatestGeminiTier(models: readonly string[], tier: GoogleModelTier):
     return lower.includes("pro") && !lower.includes("flash");
   });
 
-  const latestSuffix = candidates.find((modelId) => modelId.toLowerCase().endsWith("-latest"));
+  const stableCandidates = preferStableGemini15(candidates);
+  const preferredBase = tier === "flash" ? "gemini-1.5-flash" : "gemini-1.5-pro";
+
+  const exactLatest = stableCandidates.find(
+    (modelId) => modelId.toLowerCase() === `${preferredBase}-latest`
+  );
+  if (exactLatest) {
+    return exactLatest;
+  }
+
+  const latestSuffix = stableCandidates.find((modelId) => modelId.toLowerCase().endsWith("-latest"));
   if (latestSuffix) {
     return latestSuffix;
   }
 
-  const sorted = [...candidates].sort((a, b) => b.localeCompare(a));
+  const sorted = [...stableCandidates].sort((a, b) => b.localeCompare(a));
   return sorted[0] ?? null;
 }
 

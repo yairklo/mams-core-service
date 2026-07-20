@@ -45,7 +45,7 @@ const ANTHROPIC_MODEL_BY_TIER = {
 } as const;
 
 const GOOGLE_MODEL_PREFERENCE_BY_TIER = {
-  heavy: "gemini-1.5-pro",
+  heavy: "gemini-1.5-flash",
   light: "gemini-1.5-flash",
 } as const;
 
@@ -302,11 +302,15 @@ interface ToolActivity {
   readonly input: unknown;
   readonly output?: unknown;
   readonly error?: unknown;
+  readonly reasoning?: string | undefined;
 }
 
 function collectToolActivity(steps: readonly { content: readonly GenericContentPart[] }[]): ToolActivity[] {
   const byId = new Map<string, ToolActivity>();
   for (const step of steps) {
+    const textPart = step.content.find((part) => part.type === "text") as { text: string } | undefined;
+    const reasoning = textPart?.text?.trim() || undefined;
+
     for (const part of step.content) {
       if (!part.toolCallId) continue;
       const existing = byId.get(part.toolCallId);
@@ -317,6 +321,7 @@ function collectToolActivity(steps: readonly { content: readonly GenericContentP
           input: part.input,
           output: existing?.output,
           error: existing?.error,
+          reasoning: reasoning ?? existing?.reasoning,
         });
       } else if (part.type === "tool-result") {
         byId.set(part.toolCallId, {
@@ -325,6 +330,7 @@ function collectToolActivity(steps: readonly { content: readonly GenericContentP
           input: existing?.input ?? part.input,
           output: part.output,
           error: existing?.error,
+          reasoning: existing?.reasoning ?? reasoning,
         });
       } else if (part.type === "tool-error") {
         byId.set(part.toolCallId, {
@@ -333,6 +339,7 @@ function collectToolActivity(steps: readonly { content: readonly GenericContentP
           input: existing?.input ?? part.input,
           output: existing?.output,
           error: part.error,
+          reasoning: existing?.reasoning ?? reasoning,
         });
       }
     }
@@ -362,6 +369,7 @@ function toStepResultToolCalls(
       argsHash: hashArgs(a.input),
       locks: [],
       requestedBy,
+      ...(a.reasoning !== undefined ? { reasoning: a.reasoning } : {}),
     },
     result:
       a.error !== undefined

@@ -1152,15 +1152,24 @@ export function createToolSet(sandboxRoot: string): ToolSet {
 const CODER_MAX_EXPLORE_BEFORE_WRITE = 4;
 const CODER_IMPL_TEST_MAX_TIMEOUT_MS = 90_000;
 
+const CODER_BLOCKED_WRITE_PATH_PATTERNS: readonly RegExp[] = [
+  /(^|\/)dummy\.txt$/i,
+  /(^|\/)test\.txt$/i,
+  /(^|\/)scratch/i,
+  /(^|\/)tmp_/i,
+];
+
 const CODER_PROBE_COMMAND_PATTERNS: readonly RegExp[] = [
   /^\s*(ls|dir|tree|find|cat|head|tail|wc|grep|bash|sh)\b/i,
   /\bnode\s+-e\b.*\b(readdir|readFile|writeFile|replace)\b/i,
   /\b(sed|awk)\s+.*(-i|--in-place)/i,
 ];
 
-function isCoderProbeShellCommand(command: string, args: readonly string[]): boolean {
+const CODER_BLOCKED_SHELL_COMMANDS: readonly RegExp[] = [/^\s*git\b/i, ...CODER_PROBE_COMMAND_PATTERNS];
+
+function isCoderBlockedShellCommand(command: string, args: readonly string[]): boolean {
   const joined = [command, ...args].join(" ").trim();
-  return CODER_PROBE_COMMAND_PATTERNS.some((pattern) => pattern.test(joined));
+  return CODER_BLOCKED_SHELL_COMMANDS.some((pattern) => pattern.test(joined));
 }
 
 function bindToolExecute(agentTool: any): (input: any) => Promise<any> {
@@ -1202,7 +1211,13 @@ export function createCoderToolSet(sandboxRoot: string, blueprintStepText: strin
       description: "Writes a file within the task sandbox. Overwrites if exists.",
       inputSchema: WriteFileInputSchema,
       execute: async (input) => {
-        const result = (await writeExecute(input)) as { readonly verifiedReadBack?: boolean };
+        const parsed = WriteFileInputSchema.parse(input);
+        if (CODER_BLOCKED_WRITE_PATH_PATTERNS.some((pattern) => pattern.test(parsed.path))) {
+          throw new Error(
+            `Refusing write_file to non-product path "${parsed.path}". Edit server/ or mobile_app/ source files.`
+          );
+        }
+        const result = (await writeExecute(parsed)) as { readonly verifiedReadBack?: boolean };
         if (result.verifiedReadBack !== false) {
           hasSuccessfulWriteFile = true;
         }
@@ -1244,24 +1259,14 @@ export function createCoderToolSet(sandboxRoot: string, blueprintStepText: strin
       execute: async (input) => {
         const parsed = RunLocalTestsInputSchema.parse(input);
         if (!isVerifyStep && !hasSuccessfulWriteFile) {
-          return {
-            exitCode: 1,
-            stdout: "",
-            stderr:
-              "[MAMS] Implementation blueprint step: call write_file before run_local_tests. Shell probes (ls/cat/sed/node -e) are blocked — edit source with write_file.",
-            timedOut: false,
-            durationMs: 0,
-          } satisfies RunLocalTestsOutput;
+          throw new Error(
+            "Implementation blueprint step: call write_file before run_local_tests. Shell/git probes are blocked."
+          );
         }
-        if (isCoderProbeShellCommand(parsed.command, parsed.args)) {
-          return {
-            exitCode: 1,
-            stdout: "",
-            stderr:
-              "[MAMS] Refusing probe/shell-mutation command. Use search_files + read_file_slice, then write_file.",
-            timedOut: false,
-            durationMs: 0,
-          } satisfies RunLocalTestsOutput;
+        if (isCoderBlockedShellCommand(parsed.command, parsed.args)) {
+          throw new Error(
+            "Refusing shell/git probe command. Use search_files + read_file_slice, then write_file."
+          );
         }
         const timeoutMs = Math.min(parsed.timeoutMs, CODER_IMPL_TEST_MAX_TIMEOUT_MS);
         return testsExecute({ ...parsed, timeoutMs });

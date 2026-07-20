@@ -25,6 +25,7 @@ export interface PersistedStepToolCallView {
   readonly args: unknown;
   readonly ok: boolean;
   readonly errorMessage: string | null;
+  readonly reasoning?: string | null;
 }
 
 export interface PersistedStepView {
@@ -149,6 +150,7 @@ export function toPersistedStepView(
       args: call.request.args,
       ok: call.result.ok,
       errorMessage: call.result.ok ? null : call.result.message,
+      reasoning: call.request.reasoning ?? null,
     })),
     usage: step.usage,
     timestampMs: step.timestampMs,

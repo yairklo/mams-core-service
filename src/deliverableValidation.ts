@@ -65,6 +65,19 @@ export function validateCoderStepResult(
       meaningfulPaths: [],
     };
   }
+
+  const productWrites = result.toolCalls.filter((call) => {
+    if (call.request.toolName !== "write_file" || !call.result.ok) return false;
+    const path = (call.request.args as { path?: string }).path ?? "";
+    return /^(server|mobile_app|next_app)\//.test(path.replace(/\\/g, "/"));
+  });
+  if (!isBlueprintVerifyStep(blueprintStepText ?? null) && productWrites.length === 0) {
+    return {
+      ok: false,
+      reason: "CODER write_file must target product paths under server/, mobile_app/, or next_app/.",
+      meaningfulPaths: [],
+    };
+  }
   return { ok: true, reason: "coder_tool_calls_ok", meaningfulPaths: [] };
 }
 
